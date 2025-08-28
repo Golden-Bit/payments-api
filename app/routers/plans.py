@@ -2,130 +2,202 @@
 from __future__ import annotations
 
 from typing import Optional, Literal, Dict, Any, List
-from fastapi import APIRouter, Depends, Body, Request, HTTPException, status
+from fastapi import APIRouter, Depends, Body, Request, HTTPException
 from pydantic import BaseModel, Field, EmailStr
-import stripe
+import stripe, uuid
 
 from ..security import require_user_or_admin, Principal
 from ..utils.errors import raise_from_stripe_error
 
-router = APIRouter(prefix="/plans", tags=["plans-subscriptions"])
+router = APIRouter(
+    prefix="/plans",
+    tags=["plans-subscriptions"],
+    responses={
+        400: {"description": "Bad Request (parametri non validi o prerequisiti mancanti)"},
+        401: {"description": "Unauthorized (X-API-Key mancante o non valida)"},
+        403: {"description": "Forbidden (ruolo non sufficiente)"},
+        429: {"description": "Rate limited by Stripe"},
+        500: {"description": "Errore interno o configurazione mancante"},
+    },
+)
 
-# ---------
-# Schemi input
-# ---------
+# =============================================================================
+#                           SCHEMI INPUT (Pydantic)
+# =============================================================================
 
 class PlanRecurring(BaseModel):
-    """Definisce la cadenza di fatturazione del prezzo ricorrente."""
+    """
+    Definisce la cadenza di fatturazione di un prezzo ricorrente (Price).
+    - interval: periodo (day/week/month/year)
+    - interval_count: moltiplicatore dell'intervallo (es. 1 = mensile, 12 = annuale)
+    - usage_type: 'licensed' (per posti/licenze) o 'metered' (a consumo)
+    """
     interval: Literal["day", "week", "month", "year"] = Field(..., description="Frequenza del ciclo di fatturazione.")
-    interval_count: int = Field(1, ge=1, le=52, description="Numero di intervalli tra le fatturazioni (es. 1=mensile, 12=annuale).")
-    usage_type: Literal["licensed", "metered"] = Field("licensed", description="Modello di utilizzo: prezzo a licenza o a consumo.")
+    interval_count: int = Field(1, ge=1, le=52, description="Numero di intervalli tra le fatturazioni (1=mensile, 12=annuale, etc.).")
+    usage_type: Literal["licensed", "metered"] = Field("licensed", description="Modello di utilizzo: licenza o consumo (metered).")
+
 
 class PlanConfig(BaseModel):
     """
-    Configurazione del 'piano' da proporre in Checkout.
-    Se non passi price_id, la API creerà Product+Price con questi parametri.
+    Dettagli per creare al volo Product+Price se non passi un price_id esistente.
+    - product_id: se già esiste un Product
+    - product_name: se vuoi creare un Product con questo nome
+    - currency/unit_amount/recurring: definiscono il Price
+    - trial_period_days: prova gratuita da applicare alla Subscription
+    - metadata: metadati da scrivere sul Price
     """
     product_id: Optional[str] = Field(None, description="Se presente, il Price verrà associato a questo Product.")
     product_name: Optional[str] = Field(None, description="Nome Product da creare se product_id non è fornito.")
     currency: str = Field(..., min_length=3, max_length=3, description="Valuta ISO a 3 lettere (es. 'eur').")
     unit_amount: int = Field(..., ge=1, description="Importo per periodo in minimi della valuta (es. 2900 = 29.00 EUR).")
     recurring: PlanRecurring
-    tax_behavior: Optional[Literal["inclusive", "exclusive", "unspecified"]] = Field(None, description="Comportamento fiscale del Price.")
+    tax_behavior: Optional[Literal["inclusive", "exclusive", "unspecified"]] = Field(
+        None, description="Comportamento fiscale del Price (se supportato)."
+    )
     trial_period_days: Optional[int] = Field(None, ge=1, le=365, description="Giorni di trial da applicare alla Subscription.")
-    metadata: Optional[Dict[str, str]] = Field(default_factory=dict, description="Metadati (chiave-valore stringa) sul Price.")
+    metadata: Optional[Dict[str, str]] = Field(default_factory=dict, description="Metadati (k/v stringa) sul Price.")
+
 
 class CustomerRef(BaseModel):
     """
-    Riferimento al cliente. Usa uno di:
-    - customer_id (cus_...) per collegare cliente esistente;
-    - email (+nome) per crearne uno; puoi salvare internal_customer_ref in metadata.
+    Riferimento/creazione Customer:
+    - customer_id: riusa un Customer esistente (cus_...)
+    - email (+name): cerca/crea Customer; salva 'internal_customer_ref' in metadata
+    - search_existing_by_email: usa Customer Search su email prima di creare
+    - create_if_missing: crea il Customer se non trovato
+    - metadata: metadati aggiuntivi
     """
     customer_id: Optional[str] = Field(None, description="ID Stripe del cliente (cus_...). Se presente, si userà questo.")
-    email: Optional[EmailStr] = Field(None, description="Email cliente, usata per creare/ricercare un Customer.")
+    email: Optional[EmailStr] = Field(None, description="Email cliente, usata per cercare/creare Customer.")
     name: Optional[str] = Field(None, description="Nome visuale del cliente.")
-    search_existing_by_email: bool = Field(True, description="Se true, tenta Customer.search per email prima di crearne uno.")
-    create_if_missing: bool = Field(True, description="Se true, crea il Customer se non trovato/esistente.")
-    internal_customer_ref: Optional[str] = Field(None, description="Tuo riferimento interno (verrà scritto in metadata).")
-    metadata: Optional[Dict[str, str]] = Field(default_factory=dict, description="Metadati aggiuntivi da salvare sul Customer.")
+    search_existing_by_email: bool = Field(True, description="Se true, tenta Customer.search per email prima di creare.")
+    create_if_missing: bool = Field(True, description="Se true, crea il Customer se non trovato.")
+    internal_customer_ref: Optional[str] = Field(None, description="Tuo riferimento interno; viene scritto in metadata.")
+    metadata: Optional[Dict[str, str]] = Field(default_factory=dict, description="Metadati aggiuntivi sul Customer.")
+
 
 class CheckoutSubscriptionRequest(BaseModel):
     """
-    Crea una Checkout Session (mode=subscription) e restituisce l'URL della pagina Stripe.
-    Passa un price_id esistente o i dettagli del piano (PlanConfig) per creare Product+Price.
+    Richiesta per creare una Checkout Session (mode=subscription) e ottenere la URL Stripe.
+    Opzioni principali:
+    - price_id oppure plan (per creare Product+Price al volo)
+    - customer: CustomerRef (riuso o creazione)
+    - automatic_tax: {"enabled": true} → richiede indirizzo cliente
+    - tax_id_collection: {"enabled": true} → può richiedere update del 'name'
+    - customer_update: consenti a Checkout di aggiornare 'name' e/o 'address' sul Customer
+    - billing_address_collection: 'auto' o 'required' (consigliato 'required' con automatic_tax)
     """
-    success_url: str = Field(..., description="URL da aprire dopo il pagamento riuscito. Includi {CHECKOUT_SESSION_ID} se vuoi recuperare l'id della sessione.")
+    success_url: str = Field(..., description="URL di ritorno post-pagamento. Usa {CHECKOUT_SESSION_ID} se vuoi leggere l'id.")
     cancel_url: str = Field(..., description="URL di annullamento.")
-    price_id: Optional[str] = Field(None, description="ID di un Price ricorrente esistente (price_...). Se assente, usa 'plan'.")
+    price_id: Optional[str] = Field(None, description="ID Price ricorrente esistente (price_...). Se assente, usa 'plan'.")
     plan: Optional[PlanConfig] = Field(None, description="Dettagli del piano per creare Product+Price se non passi price_id.")
-    quantity: int = Field(1, ge=1, description="Quantità (es. posti/licenze).")
-    customer: Optional[CustomerRef] = Field(None, description="Riferimento al cliente; se assente, Checkout potrà crearne uno.")
-    client_reference_id: Optional[str] = Field(None, description="Tuo id interno per riconciliazione (comparirà sulla Session).")
-    allow_promotion_codes: bool = Field(True, description="Consente l'inserimento di codici promo in Checkout.")
-    automatic_tax: Optional[Dict[str, Any]] = Field(None, description="Esempio: {'enabled': true} per abilitare tassazione automatica.")
-    tax_id_collection: Optional[Dict[str, Any]] = Field(None, description="Esempio: {'enabled': true} per raccogliere VAT ID.")
-    locale: Optional[str] = Field(None, description="Localizzazione UI Checkout (es. 'it').")
-    subscription_metadata: Optional[Dict[str, str]] = Field(default_factory=dict, description="Metadati da scrivere sulla Subscription creata.")
-    billing_address_collection: Optional[Literal["auto", "required"]] = Field("auto", description="Raccolta indirizzo di fatturazione in Checkout.")
-    # Opzioni avanzate pass-through (usale con cautela)
+    quantity: int = Field(1, ge=1, description="Quantità (es. numero licenze).")
+    customer: Optional[CustomerRef] = Field(None, description="Cliente Stripe da collegare o creare.")
+    client_reference_id: Optional[str] = Field(None, description="Tuo id interno per riconciliazione (compare sulla Session).")
+    allow_promotion_codes: bool = Field(True, description="Consente l’inserimento di codici promo in Checkout.")
+    automatic_tax: Optional[Dict[str, Any]] = Field(None, description="Es.: {'enabled': True} per tassazione automatica.")
+    tax_id_collection: Optional[Dict[str, Any]] = Field(None, description="Es.: {'enabled': True} per raccogliere VAT/Tax ID.")
+    locale: Optional[str] = Field(None, description="Locale UI Checkout (es. 'it').")
+    subscription_metadata: Optional[Dict[str, str]] = Field(default_factory=dict, description="Metadati scritti sulla Subscription.")
+    billing_address_collection: Optional[Literal["auto", "required"]] = Field(
+        "auto", description="Raccolta indirizzo di fatturazione (consigliato 'required' con automatic_tax)."
+    )
+    # Opzioni avanzate pass-through (usare con cautela)
     payment_settings: Optional[Dict[str, Any]] = Field(None, description="Impostazioni pagamento per la Subscription.")
     payment_behavior: Optional[str] = Field(None, description="Comportamento pagamento (vedi API Subscriptions).")
 
+    # ✅ Supporto a customer_update per risolvere errori di tassazione & VAT
+    customer_update: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Es.: {'address':'auto','name':'auto'} per salvare dati inseriti in Checkout sul Customer.",
+    )
+
+
 class PortalSessionRequest(BaseModel):
-    """Crea una Billing Portal Session per un Customer e restituisce l'URL."""
+    """
+    Crea una Session del Billing Portal per far gestire all'utente:
+    - abbonamenti (cambio piano, cancellazione),
+    - metodi di pagamento,
+    - storico fatture,
+    - eventuali deep link (flow_data).
+    """
     customer_id: str = Field(..., description="ID cliente Stripe (cus_...).")
-    return_url: str = Field(..., description="URL a cui tornare al termine della gestione nel Portal.")
-    configuration: Optional[str] = Field(None, description="ID di una configurazione del Portal; se assente, usa quella di default.")
-    flow_data: Optional[Dict[str, Any]] = Field(None, description="Deep link flows del Portal (es. type='payment_method_update', 'subscription_update', ecc.).")
+    return_url: str = Field(..., description="URL a cui tornare al termine del Portal.")
+    configuration: Optional[str] = Field(None, description="ID configurazione Portal da usare (altrimenti default).")
+    flow_data: Optional[Dict[str, Any]] = Field(None, description="Deep link del Portal (es. {'type':'payment_method_update'}).")
+
 
 class CancelRequest(BaseModel):
-    """Cancellazione abbonamento: immediata o a fine periodo."""
-    cancel_now: bool = Field(False, description="Se true, cancella subito. Se false, imposta cancel_at_period_end=true.")
-    invoice_now: Optional[bool] = Field(None, description="Se cancella subito, fattura subito eventuali prorate (opzionale).")
-    prorate: Optional[bool] = Field(None, description="Se cancella subito, applica proratazione (opzionale).")
+    """Cancella una Subscription subito (invoice_now/prorate opzionali) o a fine periodo."""
+    cancel_now: bool = Field(False, description="true= cancella subito; false= fine periodo (cancel_at_period_end).")
+    invoice_now: Optional[bool] = Field(None, description="Se cancella subito, fattura subito eventuali prorate.")
+    prorate: Optional[bool] = Field(None, description="Se cancella subito, applica proratazione.")
+
 
 class PauseRequest(BaseModel):
-    """Pausa della riscossione dei pagamenti."""
-    behavior: Literal["keep_as_draft", "mark_uncollectible", "void"] = Field(..., description="Come gestire le fatture durante la pausa.")
-    resumes_at: Optional[int] = Field(None, description="Timestamp Unix opzionale per definire quando riprendere automaticamente.")
+    """Pausa la riscossione dei pagamenti impostando pause_collection."""
+    behavior: Literal["keep_as_draft", "mark_uncollectible", "void"] = Field(..., description="Gestione delle fatture durante la pausa.")
+    resumes_at: Optional[int] = Field(None, description="Timestamp Unix per ripresa automatica (opzionale).")
+
 
 class ResumeRequest(BaseModel):
-    """Ripresa di un abbonamento in pausa."""
-    billing_cycle_anchor: Optional[Literal["now", "unmodified"]] = Field(None, description="Ripristina l'anchor del ciclo di fatturazione o mantienilo inalterato.")
-    proration_behavior: Optional[Literal["create_prorations", "always_invoice", "none"]] = Field(None, description="Come gestire le proration in ripresa.")
+    """Riprende una Subscription in pausa (endpoint resume)."""
+    billing_cycle_anchor: Optional[Literal["now", "unmodified"]] = Field(None, description="Cambia/lascia l'anchor del ciclo.")
+    proration_behavior: Optional[Literal["create_prorations", "always_invoice", "none"]] = Field(None, description="Gestione proration in ripresa.")
+
 
 class PaymentMethodAttachRequest(BaseModel):
-    """Collega un PaymentMethod (pm_...) al Customer e/o setta come default della Subscription."""
-    customer_id: str = Field(..., description="ID cliente (cus_...).")
+    """Collega un PaymentMethod al Customer e opzionalmente setta default per una Subscription."""
+    customer_id: str = Field(..., description="ID Customer (cus_...).")
     payment_method_id: str = Field(..., description="ID PaymentMethod (pm_...). Ottenuto via Stripe.js/Elements/SetupIntent.")
-    set_as_default_for_subscription_id: Optional[str] = Field(None, description="Se presente, imposta questo PM come default per la Subscription indicata.")
+    set_as_default_for_subscription_id: Optional[str] = Field(
+        None, description="Se presente, imposta questo PM come default per la Subscription indicata."
+    )
 
-# ---------
-# Helpers interni
-# ---------
+# =============================================================================
+#                               HELPERS INTERNI
+# =============================================================================
+
+def _base_idem_from_request(req: Request) -> str:
+    """
+    Ricava una chiave base d’idempotenza per la richiesta corrente:
+    - usa eventuale 'Idempotency-Key' del client,
+    - altrimenti ne genera una nuova.
+    ATTENZIONE: non va riutilizzata tal quale su endpoint diversi!
+    Viene sempre derivata per operazione con _idem(...).
+    """
+    return req.headers.get("Idempotency-Key") or req.headers.get("X-Idempotency-Key") or str(uuid.uuid4())
+
+
+def _idem(base: str, suffix: str) -> str:
+    """Deriva una chiave d’idempotenza specifica per un’operazione (evita riuso cross-endpoint)."""
+    return f"{base}:{suffix}"
+
 
 def _opts_from_request(req: Request) -> Dict[str, Any]:
     """
-    Estrae header opzionali da propagare allo SDK Stripe:
-    - Idempotency-Key (idempotenza)
-    - x-stripe-account (Connect)
+    Costruisce le opzioni SDK Stripe a partire dalla request FastAPI.
+    - Propaga Stripe Connect: 'x-stripe-account' → stripe_account.
+    - NON inserire qui idempotency_key: viene passata per-singola chiamata.
     """
     opts: Dict[str, Any] = {}
-    idem = req.headers.get("Idempotency-Key") or req.headers.get("X-Idempotency-Key")
-    if idem:
-        opts["idempotency_key"] = idem
     acct = req.headers.get("x-stripe-account")
     if acct:
         opts["stripe_account"] = acct
     return opts
 
+
 def _ensure_customer(ref: Optional[CustomerRef], opts: Dict[str, Any]) -> Optional[str]:
-    """Risolvi o crea il Customer e assicura che internal_customer_ref venga salvato in metadata."""
+    """
+    Risolve/crea il Customer:
+    - Se customer_id: lo riusa e scrive eventuali metadata (internal_customer_ref).
+    - Altrimenti, se email & search_existing_by_email: Customer.search.
+    - Se non trovato e create_if_missing: Customer.create.
+    """
     if not ref:
         return None
     try:
         if ref.customer_id:
-            # aggiorna eventuale metadata
             if ref.internal_customer_ref or ref.metadata:
                 stripe.Customer.modify(
                     ref.customer_id,
@@ -133,13 +205,13 @@ def _ensure_customer(ref: Optional[CustomerRef], opts: Dict[str, Any]) -> Option
                     **opts,
                 )
             return ref.customer_id
-        # Cerca per email se richiesto
+
         cust_id = None
         if ref.email and ref.search_existing_by_email:
             res = stripe.Customer.search(query=f'email:"{ref.email}"', **opts)
             if res and res.get("data"):
                 cust_id = res["data"][0]["id"]
-        # Crea se mancante
+
         if not cust_id and ref.create_if_missing:
             created = stripe.Customer.create(
                 email=ref.email,
@@ -152,120 +224,117 @@ def _ensure_customer(ref: Optional[CustomerRef], opts: Dict[str, Any]) -> Option
     except Exception as e:
         raise_from_stripe_error(e)
 
-def _ensure_price_and_product(req: CheckoutSubscriptionRequest, opts: Dict[str, Any]) -> str:
-    """Ritorna un price_id: usa price_id se fornito, altrimenti crea Product+Price secondo PlanConfig."""
-    if req.price_id:
-        return req.price_id
-    if not req.plan:
+
+def _ensure_price_and_product(req_body: CheckoutSubscriptionRequest, opts: Dict[str, Any], base_idem: str) -> str:
+    """
+    Ritorna un price_id:
+    - Se payload.price_id presente → lo riusa.
+    - Altrimenti crea Product (se manca) e poi Price, applicando idempotency *distinte*.
+    """
+    if req_body.price_id:
+        return req_body.price_id
+    if not req_body.plan:
         raise HTTPException(status_code=400, detail="Devi fornire 'price_id' oppure 'plan'.")
+
     try:
-        product_id = req.plan.product_id
+        product_id = req_body.plan.product_id
         if not product_id:
-            # Crea Product minimale
-            p = stripe.Product.create(name=req.plan.product_name or "Subscription", **opts)
+            p = stripe.Product.create(
+                name=req_body.plan.product_name or "Subscription",
+                idempotency_key=_idem(base_idem, "product.create"),
+                **opts
+            )
             product_id = p["id"]
+
         price = stripe.Price.create(
             product=product_id,
-            currency=req.plan.currency,
-            unit_amount=req.plan.unit_amount,
+            currency=req_body.plan.currency,
+            unit_amount=req_body.plan.unit_amount,
             recurring={
-                "interval": req.plan.recurring.interval,
-                "interval_count": req.plan.recurring.interval_count,
-                "usage_type": req.plan.recurring.usage_type,
+                "interval": req_body.plan.recurring.interval,
+                "interval_count": req_body.plan.recurring.interval_count,
+                "usage_type": req_body.plan.recurring.usage_type,
             },
-            tax_behavior=req.plan.tax_behavior,
-            metadata=req.plan.metadata or {},
+            tax_behavior=req_body.plan.tax_behavior,
+            metadata=req_body.plan.metadata or {},
+            idempotency_key=_idem(base_idem, "price.create"),
             **opts,
         )
         return price["id"]
     except Exception as e:
         raise_from_stripe_error(e)
 
-# ---------
-# Endpoint principali
-# ---------
+# =============================================================================
+#                                 ENDPOINTS
+# =============================================================================
 
-@router.post("/checkout", summary="Crea pagina di pagamento (Checkout) per abbonamento e restituisce l'URL")
+@router.post(
+    "/checkout",
+    summary="Crea Checkout Session (abbonamento) e restituisce l'URL",
+    description="""
+Crea una **Checkout Session** con `mode=subscription` e restituisce:
+- `url`: link alla pagina di pagamento Stripe,
+- `id`: id della Session,
+- `customer_id`: l'eventuale Customer collegato/creato,
+- `created_product_id` / `created_price_id` se creati al volo.
+
+**Tassazione & VAT**
+- Se `automatic_tax.enabled = true`, Stripe necessita di una **tax location** valida:
+  - passa un Customer con address valido **oppure**
+  - imposta `billing_address_collection = "required"` e `customer_update.address = "auto"` per salvare l'indirizzo inserito in Checkout.
+- Se `tax_id_collection.enabled = true` su Customer esistente, abilita `customer_update.name = "auto"` per permettere l’aggiornamento del nome fiscale.
+
+**Idempotenza**
+- Ogni operazione ha una chiave derivata dedicata: `product.create`, `price.create`, `checkout.session.create`.
+    """,
+)
 def create_subscription_checkout(
     request: Request,
     p: Principal = Depends(require_user_or_admin),
-    payload: CheckoutSubscriptionRequest = Body(..., examples={
-        "piano_standard": {
-            "summary": "Piano Standard mensile EUR 29 con trial 7 giorni",
-            "description": "Crea Product+Price al volo e Checkout Session. Collega a Customer esistente e salva riferimenti interni.",
-            "value": {
-                "success_url": "https://tuo-sito.com/success?cs_id={CHECKOUT_SESSION_ID}",
-                "cancel_url": "https://tuo-sito.com/cancel",
-                "plan": {
-                    "product_name": "AI Standard",
-                    "currency": "eur",
-                    "unit_amount": 2900,
-                    "recurring": {"interval": "month", "interval_count": 1, "usage_type": "licensed"},
-                    "trial_period_days": 7,
-                    "metadata": {"plan_key": "ai_std_v1"}
-                },
-                "quantity": 1,
-                "customer": {
-                    "customer_id": "cus_1234567890",  # oppure ometti per creare da email
-                    "internal_customer_ref": "user-42"
-                },
-                "client_reference_id": "user-42",
-                "allow_promotion_codes": True,
-                "automatic_tax": {"enabled": True},
-                "tax_id_collection": {"enabled": True},
-                "subscription_metadata": {"tenant_id": "acme-1"},
-                "billing_address_collection": "auto"
-            }
-        },
-        "con_price_esistente": {
-            "summary": "Usa un Price ricorrente già esistente",
-            "value": {
-                "success_url": "https://tuo-sito.com/success?cs_id={CHECKOUT_SESSION_ID}",
-                "cancel_url": "https://tuo-sito.com/cancel",
-                "price_id": "price_abc123",
-                "customer": {"email": "mario.rossi@example.com", "name": "Mario Rossi", "internal_customer_ref": "crm-987"},
-                "client_reference_id": "crm-987"
-            }
-        }
-    })
+    payload: CheckoutSubscriptionRequest = Body(...),
 ):
-    """
-    Crea una **Checkout Session** con `mode=subscription` e restituisce:
-    - `url`: link alla pagina Stripe
-    - `id`: id della sessione (per retrieve o debug)
-    - `customer_id`: cliente collegato/creato
-    - eventuali id creati (product/price)
-    """
+    base_idem = _base_idem_from_request(request)
     opts = _opts_from_request(request)
+
     try:
-        # 1) Customer
+        # 1) Customer (riuso/ricerca/creazione)
         customer_id = _ensure_customer(payload.customer, opts)
 
-        # 2) Price
+        # 2) Price (ed eventuale Product)
         created_product_id = None
         created_price_id = None
+
         if payload.price_id:
             price_id = payload.price_id
         else:
-            pre_existing_products = set()
-            if payload.plan and payload.plan.product_id:
-                pre_existing_products.add(payload.plan.product_id)
-            price_id = _ensure_price_and_product(payload, opts)
+            price_id = _ensure_price_and_product(payload, opts, base_idem)
             created_price_id = price_id
-            # piccola euristica: se non avevi product_id, abbiamo creato un Product
+            # se abbiamo creato un Product al volo, recuperalo via expand
             if payload.plan and not payload.plan.product_id:
-                # purtroppo non abbiamo direttamente product_id qui: lo recuperiamo dal Price
-                pr_obj = stripe.Price.retrieve(price_id, expand=["product"], **opts)
-                if isinstance(pr_obj.get("product"), dict):
-                    created_product_id = pr_obj["product"]["id"]
+                pr = stripe.Price.retrieve(price_id, expand=["product"], **opts)
+                if isinstance(pr.get("product"), dict):
+                    created_product_id = pr["product"]["id"]
 
-        # 3) Subscription metadata: includi internal_customer_ref se fornito
+        # 3) Subscription metadata (aggiungi internal_customer_ref se fornito)
         subscription_metadata = {**(payload.subscription_metadata or {})}
         if payload.customer and payload.customer.internal_customer_ref:
             subscription_metadata.setdefault("internal_customer_ref", payload.customer.internal_customer_ref)
 
-        # 4) Crea Checkout Session
-        session = stripe.checkout.Session.create(
+        # 4) Fallback automatici per tassazione / VAT
+        #    (non sovrascrive valori già presenti in payload.customer_update)
+        cu = dict(payload.customer_update or {})
+        if payload.automatic_tax and payload.automatic_tax.get("enabled"):
+            # Richiedi indirizzo in Checkout e salvalo sul Customer
+            if payload.billing_address_collection != "required":
+                payload.billing_address_collection = "required"
+            cu.setdefault("address", "auto")
+
+        if payload.tax_id_collection and payload.tax_id_collection.get("enabled"):
+            # Consenti aggiornamento del 'name' per VAT (business name)
+            cu.setdefault("name", "auto")
+
+        # 5) Crea la Checkout Session (idempotency dedicata)
+        create_kwargs: Dict[str, Any] = dict(
             mode="subscription",
             success_url=payload.success_url,
             cancel_url=payload.cancel_url,
@@ -278,12 +347,22 @@ def create_subscription_checkout(
             locale=payload.locale,
             billing_address_collection=payload.billing_address_collection,
             subscription_data={
-                **({
-                       "trial_period_days": payload.plan.trial_period_days} if payload.plan and payload.plan.trial_period_days else {}),
-                "metadata": subscription_metadata
+                **({"trial_period_days": payload.plan.trial_period_days} if payload.plan and payload.plan.trial_period_days else {}),
+                "metadata": subscription_metadata,
             },
+            idempotency_key=_idem(base_idem, "checkout.session.create"),
             **opts,
         )
+        # passa customer_update solo se non vuoto
+        if cu:
+            create_kwargs["customer_update"] = cu
+        # passa eventuali opzioni avanzate
+        if payload.payment_settings:
+            create_kwargs["payment_settings"] = payload.payment_settings
+        if payload.payment_behavior:
+            create_kwargs["payment_behavior"] = payload.payment_behavior
+
+        session = stripe.checkout.Session.create(**create_kwargs)
 
         return {
             "id": session["id"],
@@ -295,29 +374,22 @@ def create_subscription_checkout(
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.post("/portal/session", summary="Crea un link al Billing Portal per gestione abbonamenti/metodi/storico")
+
+@router.post(
+    "/portal/session",
+    summary="Crea link al Billing Portal (gestione abbonamenti/metodi/storico)",
+    description="""
+Restituisce una **Billing Portal Session** (URL temporaneo Stripe-hosted) per:
+- gestione abbonamenti (cambio piano/cancellazione),
+- gestione metodi di pagamento,
+- download storico fatture.
+    """,
+)
 def create_billing_portal_session(
     request: Request,
     p: Principal = Depends(require_user_or_admin),
-    payload: PortalSessionRequest = Body(..., examples={
-        "semplice": {
-            "summary": "Portal standard",
-            "value": {"customer_id": "cus_123", "return_url": "https://tuo-sito.com/account"}
-        },
-        "deeplink": {
-            "summary": "Portal con deep link (aggiorna metodo pagamento)",
-            "value": {
-                "customer_id": "cus_123",
-                "return_url": "https://tuo-sito.com/account",
-                "flow_data": {"type": "payment_method_update"}
-            }
-        }
-    })
+    payload: PortalSessionRequest = Body(...),
 ):
-    """
-    Restituisce un URL temporaneo del **Billing Customer Portal** per il cliente.
-    Usa `flow_data` per deep link verso azioni specifiche (es. update metodo pagamento, update/cancel subscription).
-    """
     opts = _opts_from_request(request)
     try:
         sess = stripe.billing_portal.Session.create(
@@ -331,14 +403,20 @@ def create_billing_portal_session(
     except Exception as e:
         raise_from_stripe_error(e)
 
-# ---- Gestione/consultazione abbonamenti ----
+# ------------------------ Gestione/consultazione abbonamenti ------------------------
 
-@router.get("/customers/{customer_id}/subscriptions", summary="Lista abbonamenti di un Customer")
-def list_customer_subscriptions(customer_id: str, request: Request, p: Principal = Depends(require_user_or_admin), status_filter: Optional[str] = None, limit: int = 10):
-    """
-    Elenca le Subscription (active, past_due, canceled, trialing, all ...).
-    Usa `status_filter` per filtrare, altrimenti default (active).
-    """
+@router.get(
+    "/customers/{customer_id}/subscriptions",
+    summary="Lista abbonamenti di un Customer",
+    description="Restituisce le Subscription del Customer. Usa 'status_filter' (active/past_due/canceled/trialing/all) e 'limit'.",
+)
+def list_customer_subscriptions(
+    customer_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    status_filter: Optional[str] = None,
+    limit: int = 10,
+):
     opts = _opts_from_request(request)
     try:
         params: Dict[str, Any] = {"customer": customer_id, "limit": limit}
@@ -348,52 +426,89 @@ def list_customer_subscriptions(customer_id: str, request: Request, p: Principal
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.get("/subscriptions/{subscription_id}", summary="Dettaglio Subscription")
-def get_subscription(subscription_id: str, request: Request, p: Principal = Depends(require_user_or_admin)):
+
+@router.get(
+    "/subscriptions/{subscription_id}",
+    summary="Dettaglio Subscription",
+    description="Recupera una Subscription per id.",
+)
+def get_subscription(
+    subscription_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+):
     opts = _opts_from_request(request)
     try:
         return stripe.Subscription.retrieve(subscription_id, **opts)
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.post("/subscriptions/{subscription_id}/cancel", summary="Cancella abbonamento (subito o a fine periodo)")
-def cancel_subscription(subscription_id: str, request: Request, p: Principal = Depends(require_user_or_admin), payload: CancelRequest = Body(...)):
-    """
-    - Se `cancel_now=true` -> DELETE /v1/subscriptions/{id} (con invoice_now/prorate se richiesto).
-    - Altrimenti -> update cancel_at_period_end=true (si disattiva al termine del periodo corrente).
-    """
+
+@router.post(
+    "/subscriptions/{subscription_id}/cancel",
+    summary="Cancella una Subscription (immediato o a fine periodo)",
+    description="""
+- Se `cancel_now=true` → DELETE immediato (opz. invoice_now/prorate).
+- Altrimenti → update `cancel_at_period_end=true` (cancellazione al termine del periodo).
+""",
+)
+def cancel_subscription(
+    subscription_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    payload: CancelRequest = Body(...),
+):
     opts = _opts_from_request(request)
     try:
         if payload.cancel_now:
-            return stripe.Subscription.delete(subscription_id, invoice_now=payload.invoice_now, prorate=payload.prorate, **opts)
+            return stripe.Subscription.delete(
+                subscription_id,
+                invoice_now=payload.invoice_now,
+                prorate=payload.prorate,
+                **opts
+            )
         else:
             return stripe.Subscription.modify(subscription_id, cancel_at_period_end=True, **opts)
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.post("/subscriptions/{subscription_id}/pause", summary="Pausa riscossione pagamenti dell'abbonamento")
-def pause_subscription(subscription_id: str, request: Request, p: Principal = Depends(require_user_or_admin), payload: PauseRequest = Body(...)):
-    """
-    Pausa la riscossione dei pagamenti impostando `pause_collection`.
-    """
+
+@router.post(
+    "/subscriptions/{subscription_id}/pause",
+    summary="Pausa la riscossione di una Subscription",
+    description="Imposta `pause_collection` con behavior e opzionale resumes_at.",
+)
+def pause_subscription(
+    subscription_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    payload: PauseRequest = Body(...),
+):
     opts = _opts_from_request(request)
     try:
         return stripe.Subscription.modify(
             subscription_id,
             pause_collection={
                 "behavior": payload.behavior,
-                **({"resumes_at": payload.resumes_at} if payload.resumes_at else {})
+                **({"resumes_at": payload.resumes_at} if payload.resumes_at else {}),
             },
             **opts
         )
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.post("/subscriptions/{subscription_id}/resume", summary="Riprende un abbonamento in pausa")
-def resume_subscription(subscription_id: str, request: Request, p: Principal = Depends(require_user_or_admin), payload: ResumeRequest = Body(default=ResumeRequest())):
-    """
-    Usa l'endpoint dedicato **resume** per togliere la pausa e (opzionalmente) reimpostare l'anchor o creare proration.
-    """
+
+@router.post(
+    "/subscriptions/{subscription_id}/resume",
+    summary="Riprende una Subscription in pausa",
+    description="Chiama l'endpoint 'resume' con anchor/proration opzionali.",
+)
+def resume_subscription(
+    subscription_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    payload: ResumeRequest = Body(default=ResumeRequest()),
+):
     opts = _opts_from_request(request)
     try:
         return stripe.Subscription.resume(
@@ -405,36 +520,66 @@ def resume_subscription(subscription_id: str, request: Request, p: Principal = D
     except Exception as e:
         raise_from_stripe_error(e)
 
-# ---- Metodi di pagamento & storico ----
+# ------------------------ Payment Methods & storico ------------------------
 
-@router.get("/customers/{customer_id}/payment-methods", summary="Lista PaymentMethods del Customer")
-def list_payment_methods(customer_id: str, request: Request, p: Principal = Depends(require_user_or_admin), type: str = "card", limit: int = 10):
-    """
-    Restituisce i PaymentMethods salvati per il Customer (filtrabili per tipo, es. 'card', 'sepa_debit', ...).
-    """
+@router.get(
+    "/customers/{customer_id}/payment-methods",
+    summary="Lista PaymentMethods del Customer",
+    description="Filtra per tipo (es. 'card', 'sepa_debit') e limita il numero di risultati.",
+)
+def list_payment_methods(
+    customer_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    type: str = "card",
+    limit: int = 10,
+):
     opts = _opts_from_request(request)
     try:
         return stripe.PaymentMethod.list(customer=customer_id, type=type, limit=limit, **opts)
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.post("/customers/payment-methods/attach", summary="Collega un PaymentMethod a un Customer (e opzionalmente set default per una Subscription)")
-def attach_payment_method(request: Request, p: Principal = Depends(require_user_or_admin), payload: PaymentMethodAttachRequest = Body(...)):
-    """
-    Collega `pm_...` al Customer (idealmente ottenuto via SetupIntent).
-    Puoi opzionalmente impostarlo come default per una Subscription.
-    """
+
+@router.post(
+    "/customers/payment-methods/attach",
+    summary="Attach PM al Customer (+ set default per Subscription opzionale)",
+    description="""
+Collega un PaymentMethod (pm_...) al Customer (idealmente ottenuto via SetupIntent su frontend).
+Se fornisci `set_as_default_for_subscription_id`, imposta quel PM come default della Subscription.
+""",
+)
+def attach_payment_method(
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    payload: PaymentMethodAttachRequest = Body(...),
+):
     opts = _opts_from_request(request)
     try:
         pm = stripe.PaymentMethod.attach(payload.payment_method_id, customer=payload.customer_id, **opts)
         if payload.set_as_default_for_subscription_id:
-            stripe.Subscription.modify(payload.set_as_default_for_subscription_id, default_payment_method=payload.payment_method_id, **opts)
+            stripe.Subscription.modify(
+                payload.set_as_default_for_subscription_id,
+                default_payment_method=payload.payment_method_id,
+                **opts
+            )
         return pm
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.get("/customers/{customer_id}/invoices", summary="Storico fatture (Invoices) del Customer")
-def list_invoices(customer_id: str, request: Request, p: Principal = Depends(require_user_or_admin), limit: int = 10, status: Optional[str] = None):
+
+@router.get(
+    "/customers/{customer_id}/invoices",
+    summary="Storico fatture (Invoices) del Customer",
+    description="Restituisce le fatture del Customer, con filtro 'status' opzionale e 'limit'.",
+)
+def list_invoices(
+    customer_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    limit: int = 10,
+    status: Optional[str] = None,
+):
     opts = _opts_from_request(request)
     try:
         params: Dict[str, Any] = {"customer": customer_id, "limit": limit}
@@ -444,8 +589,18 @@ def list_invoices(customer_id: str, request: Request, p: Principal = Depends(req
     except Exception as e:
         raise_from_stripe_error(e)
 
-@router.get("/customers/{customer_id}/charges", summary="Storico addebiti (Charges) del Customer")
-def list_charges(customer_id: str, request: Request, p: Principal = Depends(require_user_or_admin), limit: int = 10):
+
+@router.get(
+    "/customers/{customer_id}/charges",
+    summary="Storico addebiti (Charges) del Customer",
+    description="Lista di Charges associati al Customer (limit configurabile).",
+)
+def list_charges(
+    customer_id: str,
+    request: Request,
+    p: Principal = Depends(require_user_or_admin),
+    limit: int = 10,
+):
     opts = _opts_from_request(request)
     try:
         return stripe.Charge.list(customer=customer_id, limit=limit, **opts)
