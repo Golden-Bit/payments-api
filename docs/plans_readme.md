@@ -135,7 +135,7 @@ RETURN_URL=https://tuo-sito.com/account
 3. **Script demo**
 
    ```bash
-   python demo_subscription_flow.py
+   python demo_subscription_flow_1.py
    ```
 
    * Crea o aggiorna un Customer con indirizzo valido.
@@ -264,7 +264,7 @@ Puoi far atterrare l’utente su azioni specifiche:
 4. Script demo:
 
    ```bash
-   python demo_subscription_flow.py
+   python demo_subscription_flow_1.py
    ```
 5. Completa pagamento con carta test `4242 4242 4242 4242`.
 6. Controlla `webhook_events.jsonl`:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import uuid
 from typing import Optional, Literal, Dict, Any
-
+from datetime import datetime, timezone
 import stripe
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, EmailStr
@@ -31,7 +31,7 @@ router = APIRouter(
 #                         CONFIG / DEPENDENCIES
 # =============================================================================
 
-AUTH_API_BASE = os.getenv("AUTH_API_BASE", "http://localhost:9001").rstrip("/")  # base URL del tuo servizio Auth
+AUTH_API_BASE = os.getenv("AUTH_API_BASE", "https://teatek-llm.theia-innovation.com/auth").rstrip("/")  # base URL del tuo servizio Auth
 _auth_sdk = CognitoSDK(base_url=AUTH_API_BASE)
 
 # Se necessario, puoi fissare anche la Stripe API version via env
@@ -126,30 +126,95 @@ def _require_bearer_token(authorization: Optional[str]) -> str:
     return authorization.split(" ", 1)[1].strip()
 
 
+
+def _now_ts() -> int:
+    return int(datetime.now(tz=timezone.utc).timestamp())
+
+
 def _verify_and_get_user(access_token: str) -> Dict[str, Any]:
     """
-    Usa lo SDK esistente per verificare il token e ottenere le claim.
-    Non riscriviamo nulla: chiamiamo /v1/user/verify-token del tuo servizio Auth.
+    Verifica il token via SDK Cognito e ritorna un payload normalizzato:
+    {
+      "user_ref": "<sub|username>",
+      "username": "<username se presente>",
+      "email": "<email se presente>",
+      "name": "<name/preferred_username se presente>",
+      "claims": { ... }   # tutte le claim originali
+    }
+
+    - Accetta sia risposte 'pure' con le claim (il tuo esempio) sia {"valid": true, "claims": {...}}.
+    - Verifica: exp / iat (con leeway), token_use == 'access'.
+    - user_ref: preferisce 'sub' (globally unique), fallback 'username'.
     """
     try:
-        res = _auth_sdk.verify_token(AccessTokenRequest(access_token=access_token))
-        # struttura attesa: {"valid": true, "claims": {...}, ...}
-        if not res or not res.get("valid"):
-            raise HTTPException(status_code=401, detail="Token non valido")
-        claims = res.get("claims") or {}
-        # unique user ref: prova con 'sub', fallback 'username'
-        user_ref = claims.get("sub") or claims.get("username")
-        if not user_ref:
-            raise HTTPException(status_code=401, detail="Token privo di identificatore (sub/username)")
-        # email se presente (aiuta nel creare Customer)
-        email = claims.get("email")
-        name = claims.get("name") or claims.get("cognito:username") or claims.get("preferred_username")
-        return {"user_ref": user_ref, "email": email, "name": name, "claims": claims}
-    except HTTPException:
-        raise
+        # 1) Chiamata al tuo servizio Auth tramite SDK ESISTENTE
+        resp = _auth_sdk.verify_token(AccessTokenRequest(access_token=access_token))
     except Exception as e:
+        # Es. rete giù o 4xx/5xx dell’Auth API
         raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
 
+    # 2) Normalizza la struttura risposta: può essere già claims “pure”
+    #    come nel tuo esempio, oppure avere wrapper {"valid": true, "claims": {...}}
+    if isinstance(resp, dict) and "claims" in resp:
+        claims = resp.get("claims") or {}
+        valid_flag = resp.get("valid")
+        # Se è presente "valid" e False → rifiuta
+        if valid_flag is False:
+            raise HTTPException(status_code=401, detail="Token non valido (flag 'valid' = false)")
+    elif isinstance(resp, dict):
+        # Molti servizi (o la tua implementazione) possono restituire direttamente le claim
+        # come nel tuo esempio:
+        # {'sub': '...', 'iss': '...', 'token_use': 'access', 'username': 'user-...','exp': ...}
+        claims = resp
+    else:
+        raise HTTPException(status_code=401, detail="Formato risposta verify-token non riconosciuto")
+
+    # 3) Verifiche minime di sicurezza lato gateway (oltre a quelle fatte dal tuo servizio Auth)
+    now = _now_ts()
+    leeway = 60  # 60s di tolleranza su clock skew
+
+    # exp
+    exp = claims.get("exp")
+    if isinstance(exp, int) and now > exp + leeway:
+        raise HTTPException(status_code=401, detail="Token scaduto")
+
+    # iat (opzionale: rifiuta token con iat troppo nel futuro)
+    iat = claims.get("iat")
+    if isinstance(iat, int) and iat - leeway > now:
+        raise HTTPException(status_code=401, detail="Token non ancora valido (iat nel futuro)")
+
+    # token_use (per gli access token Cognito dovrebbe essere 'access')
+    token_use = claims.get("token_use") or claims.get("tokenUse")
+    if token_use and str(token_use).lower() != "access":
+        # Se vuoi permettere anche id_token, rimuovi questo check o gestiscilo a parte
+        raise HTTPException(status_code=401, detail="Token non di tipo access")
+
+    # 4) Determina l'identificatore univoco da usare in Stripe (e nel tuo dominio)
+    #    - sub è stabile e unico (raccomandato)
+    #    - username è comodo per UI/logs ma può cambiare in alcuni setup
+    sub: Optional[str] = claims.get("sub")
+    username: Optional[str] = claims.get("username") or claims.get("cognito:username")
+
+    user_ref = sub or username
+    if not user_ref:
+        raise HTTPException(status_code=401, detail="Token privo di identificatore (mancano 'sub' e 'username')")
+
+    # 5) Info aggiuntive utili per creare/aggiornare Customer Stripe
+    email: Optional[str] = claims.get("email")
+    name: Optional[str] = (
+        claims.get("name") or
+        claims.get("preferred_username") or
+        username
+    )
+
+    # 6) Ritorna payload normalizzato
+    return {
+        "user_ref": user_ref,  # da usare come internal_customer_ref in Stripe metadata
+        "username": username,
+        "email": email,
+        "name": name,
+        "claims": claims,
+    }
 
 # =============================================================================
 #                       UTILS — STRIPE HELPERS (ME)
@@ -268,7 +333,9 @@ def me_create_checkout(
     - Crea Checkout Session (mode=subscription) con idempotency dedicata
     """
     access_token = _require_bearer_token(authorization)
+
     user = _verify_and_get_user(access_token)  # {"user_ref", "email", "name", "claims"}
+
     base_idem = _base_idem_from_request(request)
     opts = _opts_from_request(request)
 
