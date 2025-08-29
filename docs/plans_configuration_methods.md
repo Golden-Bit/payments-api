@@ -1,19 +1,3 @@
-Perfetto — qui trovi una **guida operativa completa** per costruire un **“configuratore di piani”** lato backend in Python che:
-
-1. riceve dal frontend una **configurazione JSON** del piano (es. risorse AI, storage, seats, SLA, add-on);
-2. **valida e calcola** i prezzi (con regole server-side, no trust del client);
-3. **orchestra** le tue API FastAPI: crea/aggiorna il **Customer**, genera (se serve) **Product+Price** e infine crea la **Checkout Session**;
-4. restituisce al frontend la **URL di Checkout** e i riferimenti (customer/subscription) da usare anche per il **Billing Portal**.
-
-Di seguito trovi:
-
-* un **modello dati** per il JSON del configuratore,
-* un **pricing engine** di esempio (con formule e rounding corretto),
-* un **orchestratore** che chiama le tue rotte `/admin/customers` e `/plans/checkout`,
-* varianti (per-seat vs prezzo unico), idempotenza, metadati e consigli architetturali.
-
----
-
 # 1) Schema JSON di input (esempio “AI Workspace”)
 
 Immagina un’app AI B2B con piani configurabili per team:
@@ -478,9 +462,3 @@ Con questo **configuratore**:
 * **orchestri** le tue rotte (`/admin/customers`, `/plans/checkout`) in modo robusto (idempotenza, metadata, address, automatic\_tax),
 * **restituisci l’URL** di Checkout e tracci tutto via webhook,
 * abiliti un **backend scalabile** per **piani dinamici** lato utente, senza esporre logiche di prezzo nel client.
-
-Se vuoi, posso fornirti una versione che:
-
-* **salva/riusa `price_id`** in un DB (cache fingerprint→price),
-* supporta **multi-line items** (add-on separati in Checkout),
-* include test **pytest** con `stripe-mock` e fixture di esempio.

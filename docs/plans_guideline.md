@@ -1,13 +1,3 @@
-Fantastico — ecco una **guida pratica e completa** per implementare, su una web-app, tutto il ciclo “piani & abbonamenti” sfruttando:
-
-* **la tua API FastAPI** (`/plans/*`, `/admin/*`);
-* la **UI ospitata da Stripe** (Checkout + Billing Portal);
-* una **UI personalizzata** (React/Flutter) quando serve.
-
-L’obiettivo: **configurazione dinamica** del piano, **pagamento**, **stato abbonamento**, **storico fatture**, **metodi di pagamento**, **annullamento/pausa/upgrade** e **pagina di selezione piani** (con toggle mensile/annuale) evitando acquisti duplicati.
-
----
-
 # A) Architetture possibili (e quando sceglierle)
 
 ## A1) “Hosted-first” (consigliato per velocità e compliance)
@@ -414,11 +404,3 @@ def orchestrate_checkout(p: Principal = Depends(require_user_or_admin), payload:
 5. **Idempotency**: sempre una chiave **per singola POST**.
 6. **No duplicati**: controlla subscription attive **prima** della Checkout.
 7. **Webhooks**: salva cache e audit; logga errori; non bloccare su eccezioni non critiche.
-
----
-
-Se vuoi, posso prepararti:
-
-* un **endpoint `/me/billing`** pronto all’uso,
-* un **pricing engine** con **cache `price_id`** (fingerprint→price) per non creare migliaia di Prices,
-* esempi **React** completi (pagine Piani/Account) e un **widget Flutter** riutilizzabile.

@@ -1,8 +1,4 @@
-Perfetto 👌, ora ti riscrivo il **report completo e aggiornato** con in più una sezione molto dettagliata su **come configurare e usare il Billing Portal** (sia lato Dashboard Stripe che tramite le tue API FastAPI). Mantengo tutto quello che avevi prima e lo arricchisco.
-
----
-
-# 📘 Report completo: Setup Stripe, Demo End-to-End, API, Webhook e Billing Portal
+# Report completo: Setup Stripe, Demo End-to-End, API, Webhook e Billing Portal
 
 ---
 
@@ -284,7 +280,3 @@ Puoi far atterrare l’utente su azioni specifiche:
 * Stripe CLI inoltra eventi al webhook locale.
 * Dashboard mostra tutto in **Test mode**.
 * Nessun addebito reale avviene.
-
----
-
-Vuoi che ti scriva anche una **procedura rapida “Step 1-2-3”** che puoi dare a un collega non tecnico, tipo “apri terminale, lancia questi comandi, clicca questo link, fine”?
