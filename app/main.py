@@ -1,7 +1,8 @@
+# app/api.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .routers import user, admin, proxy, webhooks, plans, me_plans
+from .routers import user, admin, proxy, webhooks, me_plans
 
 app = FastAPI(
     title="Stripe Gateway API (FastAPI)",
@@ -14,18 +15,19 @@ API FastAPI che espone operazioni lato utente e lato admin su Stripe.
 """,
 )
 
-if settings.ALLOWED_ORIGINS:
+cors_list = settings.cors_origins_list()
+if cors_list:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.ALLOWED_ORIGINS,
+        allow_origins=cors_list,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-app.include_router(user.router)
-app.include_router(admin.router)
-app.include_router(proxy.admin_proxy)
-app.include_router(proxy.user_proxy)
+# Routers
+#app.include_router(user.router)
+#app.include_router(admin.router)
+#app.include_router(proxy.admin_proxy)
+#app.include_router(proxy.user_proxy)
 app.include_router(webhooks.router)
-app.include_router(plans.router)
 app.include_router(me_plans.router)

@@ -68,10 +68,7 @@ def me_create_checkout(
       - active_price_id, active_product_id (per detection upgrade/downgrade senza webhook)
     """
     # 0) Auth utente
-    print("#"*120)
-    print(authorization)
     access_token = _require_bearer_token(authorization)
-    print("#" * 120)
     user = _verify_and_get_user(access_token)  # {"user_ref", "email", "name", "claims"}
 
     # 1) Idempotency & Stripe opts
@@ -429,7 +426,8 @@ def me_portal_deeplink_update(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-
+    print(payload.portal.features_override)
+    print("*"*120)
     access_token = _require_bearer_token(authorization)
     user = _verify_and_get_user(access_token)
     _require_api_key(x_api_key)
@@ -453,6 +451,256 @@ def me_portal_deeplink_update(
     )
     return {"url": sess["url"], "id": sess["id"], "configuration_id": config_id}
 
+
+'''@router.post(
+    "/portal/deeplinks/upgrade",
+    summary="Crea un deep-link *confermato* al Portal per upgrade/downgrade del piano (JWT + API Key)"
+)
+def me_portal_deeplink_upgrade(
+    request: Request,
+    payload: PortalUpgradeDeepLinkRequest = Body(...),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    """
+    Genera una Billing Portal Session che apre direttamente la schermata di *conferma*
+    di un update (upgrade/downgrade) della Subscription esistente, con:
+      - target price esplicito (target_price_id) oppure risolto da plan_type+variant;
+      - quantity (default 1);
+      - proration_behavior (default 'create_prorations');
+      - sconti opzionali (coupon_id, promotion_code, o lista raw 'discounts');
+      - selettore 'portal' per filtrare le varianti e applicare override UI/feature.
+    Richiede: JWT utente + API Key server.
+    """
+    # 1) Autorizzazioni e contesto
+    access_token = _require_bearer_token(authorization)
+    user = _verify_and_get_user(access_token)
+    _require_api_key(x_api_key)
+    opts = _opts_from_request(request)
+    ret_url = _validate_return_url(payload.return_url)
+
+    # 2) Ownership subscription
+    sub = stripe.Subscription.retrieve(payload.subscription_id, **opts)
+    customer_id = _ensure_customer_for_user(
+        user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
+    )
+    _ensure_subscription_ownership(sub, customer_id)
+
+    # 3) Risolvi/riusa configuration dal selettore 'portal'
+    base_idem = _base_idem_from_request(request)
+    config_id = _resolve_portal_configuration_id(
+        selector=payload.portal,
+        base_idem=base_idem,
+        opts=opts,
+    )
+
+    # 4) Determina il price target (esplicito o da plan_type+variant)
+    target_price_id = payload.target_price_id
+    created_product_id = None
+    if not target_price_id:
+        if not payload.target_plan_type or not payload.target_variant:
+            raise HTTPException(
+                status_code=400,
+                detail="Serve 'target_price_id' oppure 'target_plan_type' + 'target_variant'."
+            )
+        target_price_id, created_product_id = _ensure_price_for_variant(
+            plan_type=payload.target_plan_type,
+            variant=payload.target_variant,
+            base_idem=base_idem,
+            opts=opts,
+            allow_fallback_equivalent_any=True,
+            reactivate_if_inactive=True,
+        )
+
+    # 5) Normalizza quantità e sconti opzionali
+    qty = int(payload.quantity or 1)
+    if qty < 1:
+        qty = 1
+
+    discounts = payload.discounts or []
+    if payload.coupon_id:
+        discounts.append({"coupon": payload.coupon_id})
+    if payload.promotion_code:
+        discounts.append({"promotion_code": payload.promotion_code})
+
+    # 6) Flow confermato per il Portal
+    flow_data = {
+        "type": "subscription_update_confirm",
+        "subscription_update_confirm": {
+            "subscription": payload.subscription_id,
+            "items": [{"price": target_price_id, "quantity": qty}],
+            #"proration_behavior": payload.proration_behavior or "create_prorations",
+            **({"discounts": discounts} if discounts else {}),
+        },
+    }
+
+    # 7) Session del Billing Portal → URL pronto da aprire
+    try:
+        sess = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=ret_url,
+            configuration=config_id,
+            flow_data=flow_data,
+            idempotency_key=_idem(base_idem, f"portal.upgrade.{customer_id}.{payload.subscription_id}.{target_price_id}.{qty}"),
+            **opts,
+        )
+        return {
+            "url": sess["url"],
+            "id": sess["id"],
+            "configuration_id": config_id,
+            "target_price_id": target_price_id,
+            "created_product_id": created_product_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_from_stripe_error(e)'''
+
+'''@router.post(
+    "/portal/deeplinks/upgrade",
+    summary="Crea un deep-link *confermato* al Portal per upgrade/downgrade del piano (JWT + API Key)"
+)
+def me_portal_deeplink_upgrade(
+    request: Request,
+    payload: PortalUpgradeDeepLinkRequest = Body(...),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    """
+    Genera una Billing Portal Session che apre direttamente la schermata di *conferma*
+    di un update (upgrade/downgrade) della Subscription esistente, con:
+      - target price esplicito (target_price_id) oppure risolto da plan_type+variant;
+      - quantity (default 1);
+      - proration_behavior (default 'create_prorations');
+      - sconti opzionali (coupon_id, promotion_code, o lista raw 'discounts');
+      - selettore 'portal' per filtrare le varianti e applicare override UI/feature.
+    Richiede: JWT utente + API Key server.
+    """
+    # 1) Autorizzazioni e contesto
+    access_token = _require_bearer_token(authorization)
+    user = _verify_and_get_user(access_token)
+    _require_api_key(x_api_key)
+    opts = _opts_from_request(request)
+    ret_url = _validate_return_url(payload.return_url)
+
+    # 2) Ownership subscription (con items espansi, ci serviranno per l'id)
+    sub = stripe.Subscription.retrieve(
+        payload.subscription_id,
+        expand=["items.data.price.product"],
+        **opts,
+    )
+    customer_id = _ensure_customer_for_user(
+        user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
+    )
+    _ensure_subscription_ownership(sub, customer_id)
+
+    # 3) Risolvi/riusa configuration dal selettore 'portal'
+    base_idem = _base_idem_from_request(request)
+    config_id = _resolve_portal_configuration_id(
+        selector=payload.portal,
+        base_idem=base_idem,
+        opts=opts,
+    )
+
+    # 4) Determina il price target (esplicito o da plan_type+variant)
+    target_price_id = payload.target_price_id
+    created_product_id = None
+    if not target_price_id:
+        if not payload.target_plan_type or not payload.target_variant:
+            raise HTTPException(
+                status_code=400,
+                detail="Serve 'target_price_id' oppure 'target_plan_type' + 'target_variant'."
+            )
+        target_price_id, created_product_id = _ensure_price_for_variant(
+            plan_type=payload.target_plan_type,
+            variant=payload.target_variant,
+            base_idem=base_idem,
+            opts=opts,
+            allow_fallback_equivalent_any=True,
+            reactivate_if_inactive=True,
+        )
+
+    # 5) Normalizza quantità e sconti opzionali
+    qty = int(payload.quantity or 1)
+    if qty < 1:
+        qty = 1
+
+    discounts = list(payload.discounts or [])
+    if payload.coupon_id:
+        discounts.append({"coupon": payload.coupon_id})
+    if payload.promotion_code:
+        discounts.append({"promotion_code": payload.promotion_code})
+
+    # 6) Individua l'item da aggiornare e includi l'ID nel flow_data
+    items = (sub.get("items", {}) or {}).get("data") or []
+    if not items:
+        raise HTTPException(status_code=400, detail="Subscription priva di items aggiornabili.")
+
+    # Se possibile, scegli l'item che ha lo stesso product del target price
+    try:
+        target_price = stripe.Price.retrieve(target_price_id, **opts)
+        target_product = target_price.get("product")
+        target_product_id = target_product.get("id") if isinstance(target_product, dict) else target_product
+    except Exception:
+        target_product_id = None
+
+    # Helper per estrarre product_id dall'item
+    def _item_product_id(it: Dict[str, Any]) -> Optional[str]:
+        pr = it.get("price") or {}
+        prod = pr.get("product")
+        return prod.get("id") if isinstance(prod, dict) else prod
+
+    # Candidate: item non deleted con stesso product del target (se noto), altrimenti primo non deleted
+    candidate = None
+    if target_product_id:
+        candidate = next((it for it in items if not it.get("deleted") and _item_product_id(it) == target_product_id), None)
+    if not candidate:
+        candidate = next((it for it in items if not it.get("deleted")), None)
+    if not candidate:
+        raise HTTPException(status_code=400, detail="Nessun subscription item aggiornabile trovato.")
+
+    sub_item_id = candidate["id"]
+
+    # 7) Flow confermato per il Portal (includendo l'ID dell'item)
+    flow_data = {
+        "type": "subscription_update_confirm",
+        "subscription_update_confirm": {
+            "subscription": payload.subscription_id,
+            "items": [
+                {
+                    "id": sub_item_id,            # ← OBBLIGATORIO: item esistente da aggiornare
+                    "price": target_price_id,     # nuovo price
+                    "quantity": qty,
+                }
+            ],
+            **({"discounts": discounts} if discounts else {}),
+        },
+    }
+
+    # 8) Session del Billing Portal → URL pronto da aprire
+    try:
+        sess = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=ret_url,
+            configuration=config_id,
+            flow_data=flow_data,
+            idempotency_key=_idem(
+                base_idem,
+                f"portal.upgrade.{customer_id}.{payload.subscription_id}.{target_price_id}.{qty}"
+            ),
+            **opts,
+        )
+        return {
+            "url": sess["url"],
+            "id": sess["id"],
+            "configuration_id": config_id,
+            "target_price_id": target_price_id,
+            "created_product_id": created_product_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_from_stripe_error(e)'''
 
 @router.post(
     "/portal/deeplinks/upgrade",
