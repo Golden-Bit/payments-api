@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from typing import Optional, Literal, Dict, Any, List
 from datetime import datetime, timezone
 import stripe
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status, Security
 from pydantic import BaseModel, Field, EmailStr
 from .utils.plans_utils import _require_bearer_token, _verify_and_get_user, _base_idem_from_request, _opts_from_request, \
     _ensure_customer_for_user, _idem, _raise_from_stripe_error, \
@@ -19,6 +20,8 @@ from .utils.plans_utils import _require_bearer_token, _verify_and_get_user, _bas
     _infer_period_bounds, ensure_portal_configuration, _resolve_portal_configuration_id, \
     PortalFeaturesOverride, PortalCancelDeepLinkRequest, PortalUpdateDeepLinkRequest, BusinessProfileOverride, \
     PortalConfigSelector, _find_alive_subscription_id_for_customer, PortalSessionRequest, PortalUpgradeDeepLinkRequest
+from ..security import require_jwt_user, optional_stripe_connect_account, optional_idempotency_key, \
+    require_admin_api_key
 
 # Se riusi helper/costrutti dal router /plans, puoi importarli direttamente
 # oppure incollarne una copia qui. Qui li reimplementiamo in modo minimale e sicuro per “ME”.
@@ -33,6 +36,11 @@ router = APIRouter(
         429: {"description": "Rate limited by Stripe"},
         500: {"description": "Errore interno"},
     },
+    dependencies=[
+        Security(require_jwt_user),
+        Security(optional_stripe_connect_account),
+        Security(optional_idempotency_key),
+    ],
 )
 # =============================================================================
 #                                  ENDPOINTS “ME”
@@ -44,7 +52,6 @@ router = APIRouter(
 def me_create_checkout(
     request: Request,
     payload: DynamicCheckoutRequest = Body(...),
-    authorization: Optional[str] = Header(None),
 ):
     """
     Supporta due modalità alternative:
@@ -68,11 +75,8 @@ def me_create_checkout(
       - active_price_id, active_product_id (per detection upgrade/downgrade senza webhook)
     """
     # 0) Auth utente
-    print("#"*120)
-    print(authorization)
-    access_token = _require_bearer_token(authorization)
-    print("#" * 120)
-    user = _verify_and_get_user(access_token)  # {"user_ref", "email", "name", "claims"}
+    user = request.state.user
+    access_token = request.state.access_token
 
     # 1) Idempotency & Stripe opts
     base_idem = _base_idem_from_request(request)
@@ -351,12 +355,12 @@ def me_create_checkout(
 @router.post(
     "/portal/session",
     summary="Crea un link al Billing Portal per l'UTENTE CORRENTE (selettore 'portal' con override)",
+    dependencies=[Security(require_admin_api_key)],
 )
 def me_billing_portal(
     request: Request,
     payload: PortalSessionRequest = Body(...),  # ⬅️ nuovo schema: contiene 'portal'
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+
 ):
     """
     Genera una Billing Portal Session per l'utente corrente usando un *selettore di configurazione*:
@@ -365,10 +369,10 @@ def me_billing_portal(
       - Non c'è più logica di 'preset' a livello endpoint: l'eventuale preset è risolto all'interno
         del selettore (o ignorato se usi variants_override).
     """
+
     # 1) Auth: JWT utente + API Key admin
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
-    _require_api_key(x_api_key)
+    user = request.state.user
+    access_token = request.state.access_token
 
     # 2) Stripe opts (es. Connect) + Idempotency
     opts = _opts_from_request(request)
@@ -382,10 +386,12 @@ def me_billing_portal(
     except Exception as e:
         _raise_from_stripe_error(e)
 
+
     # 4) Validazione return_url contro allowlist
     ret_url = _validate_return_url(payload.return_url)
 
     # 5) Risolvi/riusa la Billing Portal Configuration dal selettore passato
+    start_t = time.time()
     try:
         config_id = _resolve_portal_configuration_id(
             selector=payload.portal,
@@ -398,6 +404,9 @@ def me_billing_portal(
     except Exception as e:
         # errori Stripe generici → adattati
         _raise_from_stripe_error(e)
+
+    end_t = time.time()
+    print(f"delta time# {end_t - start_t}")
 
     # 6) Crea la session del Billing Portal
     try:
@@ -422,17 +431,15 @@ def me_billing_portal(
 
 
 # >>> ADD: endpoint - UPDATE (upgrade/downgrade)
-@router.post("/portal/deeplinks/update", summary="Crea un deep-link al Portal per aggiornare il piano (JWT + API Key)")
+@router.post("/portal/deeplinks/update", summary="Crea un deep-link al Portal per aggiornare il piano (JWT + API Key)",
+             dependencies=[Security(require_admin_api_key)],)
 def me_portal_deeplink_update(
     request: Request,
     payload: PortalUpdateDeepLinkRequest = Body(...),
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
+    user = request.state.user
+    access_token = request.state.access_token
 
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
-    _require_api_key(x_api_key)
     opts = _opts_from_request(request)
     ret_url = _validate_return_url(payload.return_url)
 
@@ -448,7 +455,16 @@ def me_portal_deeplink_update(
         customer=customer_id,
         return_url=ret_url,
         configuration=config_id,
-        flow_data={"type": "subscription_update", "subscription_update": {"subscription": payload.subscription_id}},
+        flow_data={
+            "type": "subscription_update",
+            "subscription_update": {"subscription": payload.subscription_id},
+            "after_completion": {
+                "type": "redirect",
+                "redirect": {
+                    "return_url": ret_url  # ← usa la vostra URL applicativa
+                }
+            },
+        },
         **opts,
     )
     return {"url": sess["url"], "id": sess["id"], "configuration_id": config_id}
@@ -456,13 +472,12 @@ def me_portal_deeplink_update(
 
 @router.post(
     "/portal/deeplinks/upgrade",
-    summary="Crea un deep-link *confermato* al Portal per upgrade/downgrade del piano (JWT + API Key)"
+    summary="Crea un deep-link *confermato* al Portal per upgrade/downgrade del piano (JWT + API Key)",
+    dependencies=[Security(require_admin_api_key)],
 )
 def me_portal_deeplink_upgrade(
     request: Request,
     payload: PortalUpgradeDeepLinkRequest = Body(...),
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     """
     Deeplink confermato al Billing Portal per upgrade/downgrade con sconti opzionali:
@@ -471,9 +486,9 @@ def me_portal_deeplink_upgrade(
       - raw_discounts (NUOVO): specifiche "grezze" percentuali o a importo → crea Coupon e lo applica
     """
     # 1) Autorizzazioni e contesto
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
-    _require_api_key(x_api_key)
+    user = request.state.user
+    access_token = request.state.access_token
+
     opts = _opts_from_request(request)
     ret_url = _validate_return_url(payload.return_url)
     base_idem = _base_idem_from_request(request)
@@ -498,14 +513,16 @@ def me_portal_deeplink_upgrade(
 
     # 4) Determina target price (esplicito o da plan_type+variant)
     target_price_id = payload.target_price_id
-    created_product_id = None
+    target_product_id = None
+    target_currency = "eur"
     if not target_price_id:
         if not payload.target_plan_type or not payload.target_variant:
             raise HTTPException(
                 status_code=400,
                 detail="Serve 'target_price_id' oppure 'target_plan_type' + 'target_variant'."
             )
-        target_price_id, created_product_id = _ensure_price_for_variant(
+        # ⬇️ Ora _ensure_price_for_variant ritorna (price_id, product_id, price_obj)
+        target_price_id, target_product_id, price_obj = _ensure_price_for_variant(
             plan_type=payload.target_plan_type,
             variant=payload.target_variant,
             base_idem=base_idem,
@@ -513,6 +530,17 @@ def me_portal_deeplink_upgrade(
             allow_fallback_equivalent_any=True,
             reactivate_if_inactive=True,
         )
+        # Evita retrieve extra: ricava currency/product dal price_obj
+        rec_prod = price_obj.get("product")
+        target_product_id = (rec_prod.get("id") if isinstance(rec_prod, dict) else rec_prod) or target_product_id
+        target_currency = price_obj.get("currency") or target_currency
+    else:
+        # Se il caller ha fornito direttamente il price_id, recupera SOLO ciò che serve una volta
+        # (puoi anche accettare un leggero round-trip qui, ma resta un’unica chiamata)
+        pr = stripe.Price.retrieve(target_price_id, **opts)
+        rec_prod = pr.get("product")
+        target_product_id = rec_prod.get("id") if isinstance(rec_prod, dict) else rec_prod
+        target_currency = pr.get("currency") or target_currency
 
     # 5) Normalizza quantità
     qty = int(payload.quantity or 1)
@@ -523,16 +551,6 @@ def me_portal_deeplink_upgrade(
     items = (sub.get("items", {}) or {}).get("data") or []
     if not items:
         raise HTTPException(status_code=400, detail="Subscription priva di items aggiornabili.")
-
-    # Se possibile, scegli l'item con lo stesso product del target price
-    try:
-        target_price = stripe.Price.retrieve(target_price_id, **opts)
-        target_product = target_price.get("product")
-        target_product_id = target_product.get("id") if isinstance(target_product, dict) else target_product
-        target_currency = target_price.get("currency") or "eur"
-    except Exception:
-        target_product_id = None
-        target_currency = "eur"  # fallback prudente
 
     def _item_product_id(it: Dict[str, Any]) -> Optional[str]:
         pr = it.get("price") or {}
@@ -556,9 +574,6 @@ def me_portal_deeplink_upgrade(
         discounts.append({"promotion_code": payload.promotion_code})
 
     # 7.a) NUOVO: crea coupon "al volo" per ogni raw_discount e aggiungilo a discounts
-    #      - percent_off → Coupon percentuale
-    #      - amount_off  → Coupon a importo (in cent) con 'currency'
-    #      - duration    → once / repeating / forever (+ duration_in_months)
     for i, spec in enumerate(payload.raw_discounts or []):
         try:
             idem_suffix = (
@@ -573,7 +588,6 @@ def me_portal_deeplink_upgrade(
                 "idempotency_key": _idem(base_idem, idem_suffix),
                 **({"name": spec.name} if spec.name else {}),
             }
-
             if spec.duration == "repeating":
                 if not spec.duration_in_months:
                     raise HTTPException(status_code=400, detail="raw_discount.duration_in_months richiesto quando duration='repeating'")
@@ -582,7 +596,6 @@ def me_portal_deeplink_upgrade(
             if spec.kind == "percent":
                 create_kwargs["percent_off"] = float(spec.percent_off)
             else:
-                # amount_off → serve currency; se mancante, usa la currency del price target
                 currency = (spec.currency or target_currency)
                 create_kwargs["amount_off"] = int(spec.amount_off)
                 create_kwargs["currency"] = currency
@@ -608,6 +621,10 @@ def me_portal_deeplink_upgrade(
             ],
             **({"discounts": discounts} if discounts else {}),
         },
+        "after_completion": {
+            "type": "redirect",
+            "redirect": {"return_url": ret_url},
+        },
     }
 
     # 9) Crea la session del Billing Portal
@@ -628,7 +645,8 @@ def me_portal_deeplink_upgrade(
             "id": sess["id"],
             "configuration_id": config_id,
             "target_price_id": target_price_id,
-            "created_product_id": created_product_id,
+            # manteniamo la chiave storica ma ora contiene l'ID product target (può essere esistente)
+            "created_product_id": target_product_id,
         }
     except HTTPException:
         raise
@@ -637,16 +655,15 @@ def me_portal_deeplink_upgrade(
 
 
 # >>> ADD: endpoint - CANCEL
-@router.post("/portal/deeplinks/cancel", summary="Crea un deep-link al Portal per cancellare il piano (JWT + API Key)")
+@router.post("/portal/deeplinks/cancel", summary="Crea un deep-link al Portal per cancellare il piano (JWT + API Key)",
+             dependencies=[Security(require_admin_api_key)],)
 def me_portal_deeplink_cancel(
     request: Request,
     payload: PortalCancelDeepLinkRequest = Body(...),
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
-    _require_api_key(x_api_key)
+    user = request.state.user
+    access_token = request.state.access_token
+
     opts = _opts_from_request(request)
     ret_url = _validate_return_url(payload.return_url)
 
@@ -675,7 +692,15 @@ def me_portal_deeplink_cancel(
         customer=customer_id,
         return_url=ret_url,
         configuration=config_id,
-        flow_data={"type": "subscription_cancel", "subscription_cancel": {"subscription": payload.subscription_id}},
+        flow_data={"type": "subscription_cancel",
+                   "subscription_cancel": {"subscription": payload.subscription_id},
+                   "after_completion": {
+                       "type": "redirect",
+                       "redirect": {
+                           "return_url": ret_url  # ← usa la vostra URL applicativa
+                       }
+                   },
+                   },
         **opts,
     )
     return {"url": sess["url"], "id": sess["id"], "configuration_id": config_id}
@@ -687,11 +712,10 @@ def me_portal_deeplink_cancel(
 def me_get_subscription_resources(
     subscription_id: str,
     request: Request,
-    authorization: Optional[str] = Header(None),
 ):
     # 1) Auth utente (JWT) e contesto
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     # 2) Trova/garantisce il Customer dell'utente corrente
@@ -751,18 +775,18 @@ def me_get_subscription_resources(
 @router.post(
     "/subscriptions/{subscription_id}/resources/consume",
     summary="Consuma risorse della Subscription — SERVER (JWT + API Key)",
+dependencies=[Security(require_admin_api_key)],
 )
 def consume_subscription_resources(
     subscription_id: str,
     payload: ConsumeResourcesRequest = Body(...),
     request: Request = None,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+
 ):
     # 1) Autorizzazioni: JWT utente + API Key server
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
-    _require_api_key(x_api_key)
+    user = request.state.user
+    access_token = request.state.access_token
+
     opts = _opts_from_request(request)
 
     # 2) Customer dell'utente
@@ -853,18 +877,17 @@ def consume_subscription_resources(
 @router.post(
     "/subscriptions/{subscription_id}/resources/set",
     summary="Setta/Sovrascrive le risorse fornite della Subscription — SERVER (JWT + API Key)",
+dependencies=[Security(require_admin_api_key)],
 )
 def set_subscription_resources(
     subscription_id: str,
     payload: SetResourcesRequest = Body(...),
     request: Request = None,
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     # 1) Autorizzazioni: JWT utente + API Key server
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
-    _require_api_key(x_api_key)
+    user = request.state.user
+    access_token = request.state.access_token
+
     opts = _opts_from_request(request)
 
     # 2) Customer dell'utente
@@ -958,12 +981,11 @@ def set_subscription_resources(
 )
 def me_list_subscriptions(
     request: Request,
-    authorization: Optional[str] = Header(None),
     status_filter: Optional[str] = None,
     limit: int = 10,
 ):
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -983,10 +1005,9 @@ def me_list_subscriptions(
 def me_get_subscription(
     subscription_id: str,
     request: Request,
-    authorization: Optional[str] = Header(None),
 ):
-    access_token = _require_bearer_token(authorization)
-    _ = _verify_and_get_user(access_token)  # non serve altro per ora (ownership check su Connect se necessario)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1001,12 +1022,11 @@ def me_get_subscription(
 )
 def me_list_payment_methods(
     request: Request,
-    authorization: Optional[str] = Header(None),
     type: str = "card",
     limit: int = 10,
 ):
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1022,12 +1042,11 @@ def me_list_payment_methods(
 )
 def me_list_invoices(
     request: Request,
-    authorization: Optional[str] = Header(None),
     limit: int = 10,
     status: Optional[str] = None,
 ):
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1046,11 +1065,10 @@ def me_list_invoices(
 )
 def me_list_charges(
     request: Request,
-    authorization: Optional[str] = Header(None),
     limit: int = 10,
 ):
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1070,10 +1088,9 @@ def me_cancel_subscription(
     subscription_id: str,
     payload: CancelRequest = Body(...),
     request: Request = None,
-    authorization: Optional[str] = Header(None),
 ):
-    access_token = _require_bearer_token(authorization)
-    _ = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1098,10 +1115,9 @@ def me_pause_subscription(
     subscription_id: str,
     payload: PauseRequest = Body(...),
     request: Request = None,
-    authorization: Optional[str] = Header(None),
 ):
-    access_token = _require_bearer_token(authorization)
-    _ = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1125,10 +1141,10 @@ def me_resume_subscription(
     subscription_id: str,
     payload: ResumeRequest = Body(default=ResumeRequest()),
     request: Request = None,
-    authorization: Optional[str] = Header(None),
+
 ):
-    access_token = _require_bearer_token(authorization)
-    _ = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:
@@ -1155,10 +1171,9 @@ Collega un PaymentMethod (pm_...) al Customer dell'utente autenticato.
 def me_attach_payment_method(
     payload: AttachMeRequest = Body(...),
     request: Request = None,
-    authorization: Optional[str] = Header(None),
 ):
-    access_token = _require_bearer_token(authorization)
-    user = _verify_and_get_user(access_token)
+    user = request.state.user
+    access_token = request.state.access_token
     opts = _opts_from_request(request)
 
     try:

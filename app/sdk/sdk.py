@@ -64,6 +64,7 @@ class PortalFeaturesOverride(BaseModel):
     subscription_update: Optional[Dict[str, Any]] = None
     subscription_cancel: Optional[Dict[str, Any]] = None
     customer_update: Optional[Dict[str, Any]] = None
+    invoice_history: Optional[Dict[str, Any]] = None  # ⬅️ AGGIUNGI QUESTO
 
 class BusinessProfileOverride(BaseModel):
     headline: Optional[str] = None
@@ -369,7 +370,7 @@ class MePlansClient:
     ) -> Any:
         url = f"{self.api_base}{path}"
         h = self._headers(admin=admin, idempotency_suffix=idempotency_suffix)
-        print(h)
+
         resp = self._http.request(
             method,
             url,
