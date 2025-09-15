@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import stripe
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, EmailStr
+import threading
+import time as _time
 
 
 # --- NEW: Modelli per "piano dinamico controllato" ---
@@ -260,6 +262,8 @@ class PortalCancelDeepLinkRequest(BaseModel):
 #                       UTILS — TOKEN & UTENTE CORRENTE
 # =============================================================================
 
+
+
 def _require_bearer_token(authorization: Optional[str]) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing/invalid Authorization header")
@@ -376,6 +380,60 @@ def _opts_from_request(req: Request) -> Dict[str, Any]:
         opts["stripe_account"] = acct
     return opts
 
+_CUSTOMER_CACHE_LOCK = threading.Lock()
+_CUSTOMER_CACHE_TTL = int(os.getenv("CUSTOMER_CACHE_TTL", "86400"))  # 24h di default
+# struttura: { user_ref: {"cid": "cus_xxx", "ts": epoch_seconds} }
+_CUSTOMER_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def _cache_get_customer_id(user_ref: str) -> Optional[str]:
+    now = int(_time.time())
+    with _CUSTOMER_CACHE_LOCK:
+        rec = _CUSTOMER_CACHE.get(user_ref)
+        if not rec:
+            return None
+        if now - int(rec.get("ts", 0)) > _CUSTOMER_CACHE_TTL:
+            # scaduto
+            _CUSTOMER_CACHE.pop(user_ref, None)
+            return None
+        return rec.get("cid")
+
+def _cache_set_customer_id(user_ref: str, cid: str) -> None:
+    with _CUSTOMER_CACHE_LOCK:
+        _CUSTOMER_CACHE[user_ref] = {"cid": cid, "ts": int(_time.time())}
+
+
+def _get_or_ensure_customer_id_cached(
+    *,
+    user_ref: str,
+    email: Optional[str],
+    name: Optional[str],
+    opts: Dict[str, Any],
+) -> str:
+    """
+    1) prova cache (user_ref -> customer_id)
+    2) se in cache, valida con retrieve (economico). Se 404 → fallback ensure + aggiorna cache
+    3) se non in cache → ensure + cache
+    """
+    # 1) cache
+    cid = _cache_get_customer_id(user_ref)
+    if cid:
+        try:
+            # retrieve è rapido; evita la search costosa
+            stripe.Customer.retrieve(cid, **opts)
+            return cid
+        except stripe.error.InvalidRequestError as e:
+            # risorsa mancante o ID non valido → fallback a ensure
+            if getattr(e, "code", None) == "resource_missing" or "No such customer" in str(e):
+                pass
+            else:
+                # altri errori (rete, 5xx) li rilanciamo
+                raise
+
+    # 2) ensure (potrebbe fare una sola search con OR se hai applicato l'ottimizzazione suggerita)
+    cid = _ensure_customer_for_user(user_ref=user_ref, email=email, name=name, opts=opts)
+    # 3) aggiorna cache
+    _cache_set_customer_id(user_ref, cid)
+    return cid
 
 def _ensure_customer_for_user(user_ref: str, email: Optional[str], name: Optional[str], opts: Dict[str, Any]) -> str:
     """

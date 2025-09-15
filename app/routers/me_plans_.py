@@ -89,7 +89,7 @@ def me_create_checkout(
 
     try:
         # 4) Customer per l'utente corrente
-        customer_id = _ensure_customer_for_user(
+        customer_id = _get_or_ensure_customer_id_cached(
             user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
         )
 
@@ -376,7 +376,7 @@ def me_billing_portal(
 
     # 3) Trova/crea il Customer dell'utente
     try:
-        customer_id = _ensure_customer_for_user(
+        customer_id = _get_or_ensure_customer_id_cached(
             user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
         )
     except Exception as e:
@@ -438,7 +438,7 @@ def me_portal_deeplink_update(
 
     # ownership
     sub = stripe.Subscription.retrieve(payload.subscription_id, **opts)
-    customer_id = _ensure_customer_for_user(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
+    customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
     _ensure_subscription_ownership(sub, customer_id)
 
     base_idem = _base_idem_from_request(request)
@@ -484,7 +484,7 @@ def me_portal_deeplink_upgrade(
         expand=["items.data.price.product"],
         **opts,
     )
-    customer_id = _ensure_customer_for_user(
+    customer_id = _get_or_ensure_customer_id_cached(
         user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
     )
     _ensure_subscription_ownership(sub, customer_id)
@@ -651,7 +651,7 @@ def me_portal_deeplink_cancel(
     ret_url = _validate_return_url(payload.return_url)
 
     sub = stripe.Subscription.retrieve(payload.subscription_id, **opts)
-    customer_id = _ensure_customer_for_user(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
+    customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
     _ensure_subscription_ownership(sub, customer_id)
 
     base_idem = _base_idem_from_request(request)
@@ -695,7 +695,7 @@ def me_get_subscription_resources(
     opts = _opts_from_request(request)
 
     # 2) Trova/garantisce il Customer dell'utente corrente
-    customer_id = _ensure_customer_for_user(
+    customer_id = _get_or_ensure_customer_id_cached(
         user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
     )
 
@@ -766,7 +766,7 @@ def consume_subscription_resources(
     opts = _opts_from_request(request)
 
     # 2) Customer dell'utente
-    customer_id = _ensure_customer_for_user(
+    customer_id = _get_or_ensure_customer_id_cached(
         user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
     )
 
@@ -868,7 +868,7 @@ def set_subscription_resources(
     opts = _opts_from_request(request)
 
     # 2) Customer dell'utente
-    customer_id = _ensure_customer_for_user(
+    customer_id = _get_or_ensure_customer_id_cached(
         user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
     )
 
@@ -967,7 +967,7 @@ def me_list_subscriptions(
     opts = _opts_from_request(request)
 
     try:
-        customer_id = _ensure_customer_for_user(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
+        customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
         params: Dict[str, Any] = {"customer": customer_id, "limit": limit}
         if status_filter:
             params["status"] = status_filter
@@ -1010,7 +1010,7 @@ def me_list_payment_methods(
     opts = _opts_from_request(request)
 
     try:
-        customer_id = _ensure_customer_for_user(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
+        customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
         return stripe.PaymentMethod.list(customer=customer_id, type=type, limit=limit, **opts)
     except Exception as e:
         _raise_from_stripe_error(e)
@@ -1031,7 +1031,7 @@ def me_list_invoices(
     opts = _opts_from_request(request)
 
     try:
-        customer_id = _ensure_customer_for_user(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
+        customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
         params: Dict[str, Any] = {"customer": customer_id, "limit": limit}
         if status:
             params["status"] = status
@@ -1054,7 +1054,7 @@ def me_list_charges(
     opts = _opts_from_request(request)
 
     try:
-        customer_id = _ensure_customer_for_user(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
+        customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
         return stripe.Charge.list(customer=customer_id, limit=limit, **opts)
     except Exception as e:
         _raise_from_stripe_error(e)
@@ -1163,7 +1163,7 @@ def me_attach_payment_method(
 
     try:
         # Trova/crea Customer per l’utente
-        customer_id = _ensure_customer_for_user(
+        customer_id = _get_or_ensure_customer_id_cached(
             user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
         )
 
