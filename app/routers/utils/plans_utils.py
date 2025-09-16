@@ -16,6 +16,7 @@ import time as _time
 from pydantic import field_validator
 
 from app.auth_sdk.sdk import AccessTokenRequest, CognitoSDK
+from app.routers.utils.chache_utils import _FileLock, FILE_CACHE_LOCK_PATH, _load_cache_file, _save_cache_file
 
 # =============================================================================
 #                         CONFIG / DEPENDENCIES
@@ -380,26 +381,45 @@ def _opts_from_request(req: Request) -> Dict[str, Any]:
         opts["stripe_account"] = acct
     return opts
 
+
+
+
 _CUSTOMER_CACHE_LOCK = threading.Lock()
 _CUSTOMER_CACHE_TTL = int(os.getenv("CUSTOMER_CACHE_TTL", "86400"))  # 24h di default
 # struttura: { user_ref: {"cid": "cus_xxx", "ts": epoch_seconds} }
 _CUSTOMER_CACHE: Dict[str, Dict[str, Any]] = {}
 
+
 def _cache_get_customer_id(user_ref: str) -> Optional[str]:
     now = int(_time.time())
+    # manteniamo anche il lock di processo per compatibilità con chiamate in-thread
     with _CUSTOMER_CACHE_LOCK:
-        rec = _CUSTOMER_CACHE.get(user_ref)
-        if not rec:
-            return None
-        if now - int(rec.get("ts", 0)) > _CUSTOMER_CACHE_TTL:
-            # scaduto
-            _CUSTOMER_CACHE.pop(user_ref, None)
-            return None
-        return rec.get("cid")
+        with _FileLock(FILE_CACHE_LOCK_PATH):
+            data = _load_cache_file()
+            rec = (data.get("customers") or {}).get(user_ref)
+            if not rec:
+                return None
+            ts = int(rec.get("ts") or 0)
+            if (now - ts) > _CUSTOMER_CACHE_TTL:
+                # scaduto → elimina e salva
+                try:
+                    del data["customers"][user_ref]
+                    _save_cache_file(data)
+                except Exception:
+                    pass
+                return None
+            return rec.get("cid")
 
 def _cache_set_customer_id(user_ref: str, cid: str) -> None:
+    now = int(_time.time())
     with _CUSTOMER_CACHE_LOCK:
-        _CUSTOMER_CACHE[user_ref] = {"cid": cid, "ts": int(_time.time())}
+        with _FileLock(FILE_CACHE_LOCK_PATH):
+            data = _load_cache_file()
+            cust = data.get("customers") or {}
+            cust[user_ref] = {"cid": cid, "ts": now}
+            data["customers"] = cust
+            _save_cache_file(data)
+
 
 
 def _get_or_ensure_customer_id_cached(
@@ -416,10 +436,11 @@ def _get_or_ensure_customer_id_cached(
     """
     # 1) cache
     cid = _cache_get_customer_id(user_ref)
+
     if cid:
         try:
             # retrieve è rapido; evita la search costosa
-            stripe.Customer.retrieve(cid, **opts)
+            #stripe.Customer.retrieve(cid, **opts)
             return cid
         except stripe.error.InvalidRequestError as e:
             # risorsa mancante o ID non valido → fallback a ensure
@@ -515,6 +536,9 @@ def _compute_remaining(provided: List[Dict[str, Any]], used: List[Dict[str, Any]
 def _assert_not_exceed(provided: List[Dict[str, Any]], used: List[Dict[str, Any]]) -> None:
     mp = _to_map(provided)
     mu = _to_map(used)
+
+    #print(mp, mu)
+
     for key, uq in mu.items():
         if uq - 1e-9 > mp.get(key, 0.0):  # tolleranza float minima
             k, u = key
@@ -612,17 +636,20 @@ def _assert_consume_constraints(plan_type: str, deltas: List[Dict[str, Any]]) ->
       - non controlliamo min/max qui (sarà _assert_not_exceed a garantire che used<=provided)
     """
     rules = RESOURCE_RULES.get(plan_type) or {}
+
     for it in deltas:
         key = it.get("key")
         unit = it.get("unit")
         dq = float(it.get("quantity", 0) or 0)
         if dq < 0:
+
             raise HTTPException(status_code=400, detail="Quantità negativa non consentita nel consumo.")
         r = rules.get(key) or {}
         st = r.get("step")
         if st is not None and st > 0:
             k = dq / float(st)
             if abs(round(k) - k) > 1e-9:
+
                 raise HTTPException(
                     status_code=400,
                     detail=f"Delta consumo non allineato allo step per resource='{key}' unit='{unit}' (step={st})"

@@ -23,6 +23,7 @@ from .utils.plans_utils import _require_bearer_token, _verify_and_get_user, _bas
 from ..security import require_jwt_user, optional_stripe_connect_account, optional_idempotency_key, \
     require_admin_api_key
 
+
 # Se riusi helper/costrutti dal router /plans, puoi importarli direttamente
 # oppure incollarne una copia qui. Qui li reimplementiamo in modo minimale e sicuro per “ME”.
 
@@ -783,6 +784,7 @@ def consume_subscription_resources(
     request: Request = None,
 
 ):
+
     # 1) Autorizzazioni: JWT utente + API Key server
     user = request.state.user
     access_token = request.state.access_token
@@ -830,6 +832,7 @@ def consume_subscription_resources(
     used = _parse_resources_json(md.get("resources_used_json"))
     plan_type = md.get("plan_type") or ""
     delta_list = [it.model_dump() for it in payload.items]
+
     _assert_consume_constraints(plan_type, delta_list)
 
     # 8) Calcola il nuovo "used" sommando il delta richiesto
@@ -844,6 +847,7 @@ def consume_subscription_resources(
     new_used = _to_list(new_used_map)
 
     # 9) Guardrail: non superare il provided
+
     _assert_not_exceed(provided, new_used)
 
     # 10) Aggiorna i metadata in Stripe

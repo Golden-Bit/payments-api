@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import stripe
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, EmailStr
+import threading
+import time as _time
 
 
 # --- NEW: Modelli per "piano dinamico controllato" ---
@@ -260,6 +262,8 @@ class PortalCancelDeepLinkRequest(BaseModel):
 #                       UTILS — TOKEN & UTENTE CORRENTE
 # =============================================================================
 
+
+
 def _require_bearer_token(authorization: Optional[str]) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing/invalid Authorization header")
@@ -377,6 +381,65 @@ def _opts_from_request(req: Request) -> Dict[str, Any]:
     return opts
 
 
+
+
+_CUSTOMER_CACHE_LOCK = threading.Lock()
+_CUSTOMER_CACHE_TTL = int(os.getenv("CUSTOMER_CACHE_TTL", "86400"))  # 24h di default
+# struttura: { user_ref: {"cid": "cus_xxx", "ts": epoch_seconds} }
+_CUSTOMER_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _cache_get_customer_id(user_ref: str) -> Optional[str]:
+    now = int(_time.time())
+    with _CUSTOMER_CACHE_LOCK:
+        rec = _CUSTOMER_CACHE.get(user_ref)
+        if not rec:
+            return None
+        if now - int(rec.get("ts", 0)) > _CUSTOMER_CACHE_TTL:
+            # scaduto
+            _CUSTOMER_CACHE.pop(user_ref, None)
+            return None
+        return rec.get("cid")
+
+def _cache_set_customer_id(user_ref: str, cid: str) -> None:
+    with _CUSTOMER_CACHE_LOCK:
+        _CUSTOMER_CACHE[user_ref] = {"cid": cid, "ts": int(_time.time())}
+
+
+def _get_or_ensure_customer_id_cached(
+    *,
+    user_ref: str,
+    email: Optional[str],
+    name: Optional[str],
+    opts: Dict[str, Any],
+) -> str:
+    """
+    1) prova cache (user_ref -> customer_id)
+    2) se in cache, valida con retrieve (economico). Se 404 → fallback ensure + aggiorna cache
+    3) se non in cache → ensure + cache
+    """
+    # 1) cache
+    cid = _cache_get_customer_id(user_ref)
+
+    if cid:
+        try:
+            # retrieve è rapido; evita la search costosa
+            stripe.Customer.retrieve(cid, **opts)
+            return cid
+        except stripe.error.InvalidRequestError as e:
+            # risorsa mancante o ID non valido → fallback a ensure
+            if getattr(e, "code", None) == "resource_missing" or "No such customer" in str(e):
+                pass
+            else:
+                # altri errori (rete, 5xx) li rilanciamo
+                raise
+
+    # 2) ensure (potrebbe fare una sola search con OR se hai applicato l'ottimizzazione suggerita)
+    cid = _ensure_customer_for_user(user_ref=user_ref, email=email, name=name, opts=opts)
+    # 3) aggiorna cache
+    _cache_set_customer_id(user_ref, cid)
+    return cid
+
 def _ensure_customer_for_user(user_ref: str, email: Optional[str], name: Optional[str], opts: Dict[str, Any]) -> str:
     """
     Trova o crea UNICO Customer Stripe per l'utente corrente.
@@ -457,6 +520,9 @@ def _compute_remaining(provided: List[Dict[str, Any]], used: List[Dict[str, Any]
 def _assert_not_exceed(provided: List[Dict[str, Any]], used: List[Dict[str, Any]]) -> None:
     mp = _to_map(provided)
     mu = _to_map(used)
+
+    #print(mp, mu)
+
     for key, uq in mu.items():
         if uq - 1e-9 > mp.get(key, 0.0):  # tolleranza float minima
             k, u = key
@@ -554,17 +620,20 @@ def _assert_consume_constraints(plan_type: str, deltas: List[Dict[str, Any]]) ->
       - non controlliamo min/max qui (sarà _assert_not_exceed a garantire che used<=provided)
     """
     rules = RESOURCE_RULES.get(plan_type) or {}
+
     for it in deltas:
         key = it.get("key")
         unit = it.get("unit")
         dq = float(it.get("quantity", 0) or 0)
         if dq < 0:
+
             raise HTTPException(status_code=400, detail="Quantità negativa non consentita nel consumo.")
         r = rules.get(key) or {}
         st = r.get("step")
         if st is not None and st > 0:
             k = dq / float(st)
             if abs(round(k) - k) > 1e-9:
+
                 raise HTTPException(
                     status_code=400,
                     detail=f"Delta consumo non allineato allo step per resource='{key}' unit='{unit}' (step={st})"
@@ -797,13 +866,18 @@ def _ensure_product(product_key: str, product_name: str, base_idem: str, opts: D
     )
     return p["id"]
 
-
-def _ensure_price_for_variant(plan_type: str,
-                              variant: str,
-                              base_idem: str,
-                              opts: Dict[str, Any],
-                              allow_fallback_equivalent_any: bool = True,
-                              reactivate_if_inactive: bool = True) -> Tuple[str, str]:
+def _ensure_price_for_variant(
+    plan_type: str,
+    variant: str,
+    base_idem: str,
+    opts: Dict[str, Any],
+    allow_fallback_equivalent_any: bool = True,
+    reactivate_if_inactive: bool = True
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Garantisce esistenza (o riuso) del Price per (plan_type, variant).
+    Restituisce: (price_id, product_id, price_obj) per evitare future Price.retrieve.
+    """
     variants = PLAN_VARIANTS.get(plan_type) or {}
     vconf = variants.get(variant)
     if not vconf:
@@ -813,55 +887,85 @@ def _ensure_price_for_variant(plan_type: str,
         raise HTTPException(status_code=400, detail=f"Variante '{variant}' priva di blueprint")
 
     policy = PLAN_POLICIES.get(plan_type) or {}
-    currency = policy.get("currency") or "eur"
-
-    product_key = bp["product_key"]
-    product_name = bp["product_name"]
-    unit_amount = int(bp["unit_amount"])
-    interval = bp.get("interval") or policy.get("recurring", {}).get("interval") or "month"
+    currency       = policy.get("currency") or "eur"
+    product_key    = bp["product_key"]
+    product_name   = bp["product_name"]
+    unit_amount    = int(bp["unit_amount"])
+    interval       = bp.get("interval") or policy.get("recurring", {}).get("interval") or "month"
     interval_count = int(bp.get("interval_count") or policy.get("recurring", {}).get("interval_count") or 1)
-    usage_type = bp.get("usage_type") or policy.get("recurring", {}).get("usage_type") or "licensed"
-    tax_behavior = policy.get("tax_behavior") or "exclusive"
+    usage_type     = bp.get("usage_type") or policy.get("recurring", {}).get("usage_type") or "licensed"
+    tax_behavior   = policy.get("tax_behavior") or "exclusive"
 
+    # 1) Product (riuso/creazione)
     product_id = _ensure_product(product_key, product_name, base_idem, opts)
+
+    # 2) Lista price del product (unica chiamata; useremo questi payload fino alla fine)
     prices = _list_prices_for_product(product_id, opts)
 
+    # 3) Cerca equivalente col TAG di variant
     pr = _pick_latest_equivalent_by_variant(
-        prices, variant=variant, currency=currency, unit_amount=unit_amount,
-        interval=interval, interval_count=interval_count, usage_type=usage_type, tax_behavior=tax_behavior
+        prices,
+        variant=variant,
+        currency=currency,
+        unit_amount=unit_amount,
+        interval=interval,
+        interval_count=interval_count,
+        usage_type=usage_type,
+        tax_behavior=tax_behavior,
     )
     if pr:
-        if reactivate_if_inactive and pr.get("active") is False:
+        if reactivate_if_inactive and (pr.get("active") is False):
             stripe.Price.modify(pr["id"], active=True, **opts)
-        return pr["id"], product_id
+            pr = {**pr, "active": True}
+        return pr["id"], product_id, pr
 
+    # 4) Fallback: qualunque equivalente, poi patch metadata 'variant'
     if allow_fallback_equivalent_any:
         pr2 = _search_equivalent_any(
-            prices, currency=currency, unit_amount=unit_amount,
-            interval=interval, interval_count=interval_count, usage_type=usage_type, tax_behavior=tax_behavior
+            prices,
+            currency=currency,
+            unit_amount=unit_amount,
+            interval=interval,
+            interval_count=interval_count,
+            usage_type=usage_type,
+            tax_behavior=tax_behavior,
         )
         if pr2:
             md = dict(pr2.get("metadata") or {})
+            changed = False
             if md.get("variant") != variant:
                 md["variant"] = variant
                 md.setdefault("plan_type", plan_type)
                 md.setdefault("product_key", product_key)
                 stripe.Price.modify(pr2["id"], metadata=md, **opts)
-            if reactivate_if_inactive and pr2.get("active") is False:
+                pr2 = {**pr2, "metadata": md}
+                changed = True
+            if reactivate_if_inactive and (pr2.get("active") is False):
                 stripe.Price.modify(pr2["id"], active=True, **opts)
-            return pr2["id"], product_id
+                pr2 = {**pr2, "active": True}
+                changed = True
+            # Nota: se non è cambiato nulla, riusiamo pr2 “as is”
+            return pr2["id"], product_id, pr2
 
+    # 5) Nessun equivalente → creiamo il Price
     pr_new = stripe.Price.create(
         product=product_id,
         currency=currency,
         unit_amount=unit_amount,
-        recurring={"interval": interval, "interval_count": interval_count, "usage_type": usage_type},
+        recurring={
+            "interval": interval,
+            "interval_count": interval_count,
+            "usage_type": usage_type,
+        },
         tax_behavior=tax_behavior,
         metadata={"plan_type": plan_type, "variant": variant, "product_key": product_key},
-        idempotency_key=_idem(base_idem, f"price.ensure.variant.{plan_type}.{variant}.{unit_amount}.{currency}.{interval}.{interval_count}.{usage_type}"),
+        idempotency_key=_idem(
+            base_idem,
+            f"price.ensure.variant.{plan_type}.{variant}.{unit_amount}.{currency}.{interval}.{interval_count}.{usage_type}"
+        ),
         **opts,
     )
-    return pr_new["id"], product_id
+    return pr_new["id"], product_id, pr_new
 
 
 
@@ -983,38 +1087,33 @@ def _list_portal_configurations(opts: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 from collections import defaultdict
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) _assert_unique_intervals_per_product — usa dati già in memoria, zero HTTP
+# ─────────────────────────────────────────────────────────────────────────────
 def _assert_unique_intervals_per_product(
-    product_price_pairs: List[Dict[str, str]],
-    opts: Dict[str, Any]
+    product_price_pairs: List[Dict[str, Any]],
+    opts: Dict[str, Any]  # tenuto per compatibilità firma, NON usato
 ) -> None:
     """
-    Verifica che, per ciascun product, non ci siano più price con lo stesso
-    intervallo ricorrente (interval + interval_count). In caso di conflitto,
-    solleva HTTP 400 con dettagli.
+    Controlla che per ogni product non ci siano due price con lo stesso
+    (interval, interval_count). Usa i campi già presenti nei pair:
+      {"product_id", "price_id", "interval", "interval_count"}
     """
-    by_product: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    by_product: Dict[str, Dict[str, str]] = {}
     for pair in product_price_pairs:
-        price_id = pair["price_id"]
-        product_id = pair["product_id"]
-        pr = stripe.Price.retrieve(price_id, **opts)
-        rec = pr.get("recurring") or {}
-        interval_key = f'{rec.get("interval")}:{int(rec.get("interval_count") or 1)}'
-        by_product[product_id].append((price_id, interval_key))
-
-    for pid, lst in by_product.items():
-        seen: Dict[str, str] = {}
-        for price_id, iv in lst:
-            if iv in seen:
-                # prezzo duplicato per lo stesso intervallo sullo stesso product → errore
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "For each product, its price must have unique billing intervals. "
-                        f"Product '{pid}' has duplicate interval '{iv}' for prices: "
-                        f"{seen[iv]} and {price_id}."
-                    ),
-                )
-            seen[iv] = price_id
+        pid = pair["product_id"]
+        ivk = f'{pair.get("interval")}:{int(pair.get("interval_count") or 1)}'
+        seen = by_product.setdefault(pid, {})
+        if ivk in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "For each product, its price must have unique billing intervals. "
+                    f"Product '{pid}' has duplicate interval '{ivk}' for prices: "
+                    f"{seen[ivk]} and {pair['price_id']}."
+                ),
+            )
+        seen[ivk] = pair["price_id"]
 
 def _build_portal_features(product_price_pairs: List[Dict[str, str]]) -> Dict[str, Any]:
     """
@@ -1168,6 +1267,7 @@ class PortalFeaturesOverride(BaseModel):
     subscription_update: Optional[Dict[str, Any]] = None
     subscription_cancel: Optional[Dict[str, Any]] = None
     customer_update: Optional[Dict[str, Any]] = None
+    invoice_history: Optional[Dict[str, Any]] = None  # ⬅️ AGGIUNGI QUESTO
 
 class BusinessProfileOverride(BaseModel):
     headline: Optional[str] = None
@@ -1242,9 +1342,18 @@ def _config_fingerprint(
     s = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE process-local (fingerprint → configuration_id) per ridurre Configuration.list
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PORTAL_CONF_CACHE: Dict[str, str] = {}
+
+def _portal_cache_key(plan_type: str, tag_val: str, fp: str) -> str:
+    return f"portal:{plan_type}:{tag_val}:{fp}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RISCRITTURA COMPLETA: ensure_portal_configuration_with_overrides (senza sanitize)
+# 3) ensure_portal_configuration_with_overrides — nessun retrieve superfluo + cache
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_portal_configuration_with_overrides(
     *,
@@ -1257,17 +1366,13 @@ def ensure_portal_configuration_with_overrides(
     features_override: Optional[PortalFeaturesOverride] = None,
 ) -> str:
     """
-    Variante di ensure_portal_configuration che consente:
-      - usare 'variants_override' al posto del preset;
-      - passare features/business_profile custom.
-
-    Differenze chiave:
-      - Nessuna sanificazione dei 'features': ciò che componi è ciò che invii.
-      - Calcoliamo un fingerprint (features + business_profile + tag + plan_type).
-      - Riutilizziamo una configuration solo se il metadata 'features_fp' corrisponde.
-      - Se non corrisponde (o manca), NON modifichiamo quella esistente: creiamo una nuova configuration.
+    - Risolve varianti da preset/override
+    - Provisioning Price/Product senza retrieve ridondanti
+    - Esclude price free (unit_amount <= 0) senza chiamate extra
+    - Controlla duplicati intervallo in-memory
+    - Cache fingerprint→configuration_id per evitare Configuration.list
     """
-    # 1) Risolvi varianti (preset o override)
+    # 1) Varianti
     if variants_override and len(variants_override) > 0:
         variants = variants_override
     else:
@@ -1277,43 +1382,60 @@ def ensure_portal_configuration_with_overrides(
         if not variants:
             raise HTTPException(status_code=400, detail=f"Preset Portal non valido: '{portal_preset}'")
 
-    # 2) Validazione plan_type/varianti e provisioning prices/products
+    # 2) Plan/varianti note
     all_variants = PLAN_VARIANTS.get(plan_type)
     if not all_variants:
         raise HTTPException(status_code=400, detail=f"plan_type sconosciuto per il Portal: '{plan_type}'")
 
-    product_price_pairs: List[Dict[str, str]] = []
+    # 3) Provisioning price/product (riuso/crea) — nessun Price.retrieve fuori da qui
+    product_price_pairs: List[Dict[str, Any]] = []
     for v in variants:
         if v not in all_variants:
             raise HTTPException(status_code=400, detail=f"Variante '{v}' non definita per plan_type '{plan_type}'")
-        price_id, product_id = _ensure_price_for_variant(plan_type, v, base_idem, opts)
-        pr = stripe.Price.retrieve(price_id, **opts)
-        if int(pr.get("unit_amount") or 0) <= 0:  # escludi piani free
+
+        price_id, product_id, price_obj = _ensure_price_for_variant(plan_type, v, base_idem, opts)
+
+        # Filtra “free” senza recuperare di nuovo: unit_amount è già qui
+        unit_amount = int(price_obj.get("unit_amount") or 0)
+        if unit_amount <= 0:
             continue
-        product_price_pairs.append({"product_id": product_id, "price_id": price_id})
+
+        rec = price_obj.get("recurring") or {}
+        product_price_pairs.append({
+            "product_id":     product_id,
+            "price_id":       price_id,
+            "interval":       rec.get("interval"),
+            "interval_count": int(rec.get("interval_count") or 1),
+            "unit_amount":    unit_amount,
+        })
 
     if not product_price_pairs:
         raise HTTPException(status_code=400, detail="Nessun price valido (>0) per costruire il Portal.")
 
+    # 4) Guard-rail duplicati (nessuna chiamata HTTP)
     _assert_unique_intervals_per_product(product_price_pairs, opts)
 
-    # 3) Costruisci i features di base (products/price, proration_behavior, ecc.)
-    features = _default_features_for_products(product_price_pairs)
-
-
-    # 3.b Merge override (mantieni 'products' base se non esplicitati nell'override)
+    # 5) Features base (+ eventuale override)
+    products_block = [{"product": p["product_id"], "prices": [p["price_id"]]} for p in product_price_pairs]
+    features = {
+        "payment_method_update": {"enabled": True},
+        "subscription_update": {
+            "enabled": True,
+            "default_allowed_updates": ["price"],
+            "proration_behavior": "create_prorations",
+            "products": products_block,
+        },
+        "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+    }
     if features_override:
         ov = features_override.model_dump(exclude_none=True)
-
-
-        # merge shallow per chiavi top-level (eccetto subscription_update)
+        # merge shallow tranne subscription_update
         for k, v in ov.items():
             if k != "subscription_update":
                 features[k] = v
-
-        # deep-merge per subscription_update: preserva 'products' se l'override non li specifica
+        # deep-merge per subscription_update (preserva products se assente nell'override)
         su_base = features.get("subscription_update", {}) or {}
-        su_ov = ov.get("subscription_update") or {}
+        su_ov   = ov.get("subscription_update") or {}
         if su_ov:
             merged = dict(su_base)
             for kk, vv in su_ov.items():
@@ -1324,45 +1446,43 @@ def ensure_portal_configuration_with_overrides(
                 merged["products"] = su_ov["products"]
             features["subscription_update"] = merged
 
-    # 4) Business profile (default + override)
+    # 6) Business profile
     business_profile = {"headline": f"{plan_type} plans"}
     if business_profile_override:
         business_profile.update(business_profile_override.model_dump(exclude_none=True))
 
-    # 5) Fingerprint desiderato (features + business_profile + tag + plan_type)
-    existing = _list_portal_configurations(opts)
-    tag_val = portal_preset or "custom"
-    desired_fp = _config_fingerprint(
-        plan_type=plan_type, tag=tag_val, features=features, business_profile=business_profile
-    )
+    # 7) Fingerprint & cache
+    tag_val   = portal_preset or "custom"
+    desired_fp = _config_fingerprint(plan_type=plan_type, tag=tag_val, features=features, business_profile=business_profile)
 
-    # 6) Tenta riuso SOLO se il fingerprint coincide
+    cache_key = _portal_cache_key(plan_type, tag_val, desired_fp)
+    cached_id = _PORTAL_CONF_CACHE.get(cache_key)
+    if cached_id:
+        return cached_id
+
+    # 8) Prova riuso solo se necessario (cache miss)
+    existing = _list_portal_configurations(opts)
     for conf in existing:
         md = conf.get("metadata") or {}
-        if md.get("plan_type") == plan_type and md.get("portal_preset") == tag_val:
-            if md.get("features_fp") == desired_fp:
-                # fingerprint identico → riuso sicuro
-                # (se vuoi, puoi fare un touch del business_profile, ma se lo includi nel fingerprint,
-                #  un cambio del business_profile produrrà un fingerprint diverso e quindi creerai una nuova config)
-                return conf["id"]
-            # fingerprint diverso → NON modificare in place, crea una nuova configuration
+        if md.get("plan_type") == plan_type and md.get("portal_preset") == tag_val and md.get("features_fp") == desired_fp:
+            _PORTAL_CONF_CACHE[cache_key] = conf["id"]
+            return conf["id"]
 
-    # 7) Crea una nuova configuration “pulita” con fingerprint nei metadata
-
+    # 9) Crea nuova configuration
     created = stripe.billing_portal.Configuration.create(
         business_profile=business_profile,
         features=features,
         metadata={
             "plan_type": plan_type,
             "portal_preset": tag_val,
-            "features_fp": desired_fp,          # fingerprint per riuso sicuro in futuro
-            "features_version": "v2_fp_only",   # tag di versione (opzionale, utile per audit)
+            "features_fp": desired_fp,
+            "features_version": "v2_fp_only",
         },
         idempotency_key=_idem(base_idem, f"portal.config.create.{plan_type}.{tag_val}.{desired_fp[:10]}"),
         **opts,
     )
+    _PORTAL_CONF_CACHE[cache_key] = created["id"]
     return created["id"]
-
 
 
 # >>> ADD: risolutore "selettore" per ottenere una Configuration pronta (reuse o create)
@@ -1461,6 +1581,21 @@ PORTAL_PRESETS: Dict[str, List[str]] = {
     "annual":  [ "base_annual",  "pro_annual"],
 }
 
+PORTAL_PRESETS: Dict[str, List[str]] = {
+    # mostriamo le 3 varianti mensili nel portal "monthly"
+    "monthly": [
+        "starter_monthly",
+        "premium_monthly",
+        "enterprise_monthly",
+    ],
+    # e le 3 varianti annuali nel portal "annual"
+    "annual": [
+        "starter_annual",
+        "premium_annual",
+        "enterprise_annual",
+    ],
+}
+
 
 
 # --- NEW: Regole per risorsa per plan_type (vincoli min/max/step) ---
@@ -1486,7 +1621,7 @@ PORTAL_PRESETS: Dict[str, List[str]] = {
 
 # --- Regole risorsa: ora gestiamo solo "credits" (accumulabili) ---
 RESOURCE_RULES: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {
-    "AI Standard": {
+    "ai_standard": {
         "credits": {"min": 0.0, "max": None, "step": 1.0},  # step 1 credito
     },
     "AI Pro": {
@@ -1498,7 +1633,7 @@ RESOURCE_RULES: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {
 # --- MOD: Policy lato server per ogni plan_type (aggiunte chiavi res_*) ---
 
 PLAN_POLICIES: Dict[str, Dict[str, Any]] = {
-    "AI Standard": {
+    "ai_standard": {
         "currency": "eur",
         "recurring": {"interval": "month", "interval_count": 1, "usage_type": "licensed"},
         #"trial_period_days": 7,
@@ -1541,7 +1676,7 @@ PLAN_POLICIES: Dict[str, Dict[str, Any]] = {
 }
 
 
-PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
+'''PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "AI Standard": {
         # Mensili
         "base_monthly": {
@@ -1595,7 +1730,100 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
             "res_mode": "add",
         },
     },
+}'''
+
+PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "ai_standard": {
+        # ───────────── Mensili ─────────────
+        "starter_monthly": {
+            "blueprint": {
+                "product_key":  "ai_std_starter_monthly",
+                "product_name": "BoxedAI – Starter (Monthly)",
+                "unit_amount":  199,   # €1.99
+                "interval":     "month",
+                "interval_count": 1,
+                "usage_type":   "licensed",
+            },
+            "base_resources": [
+                {"key": "credits", "quantity": 1000, "unit": "credits"},
+            ],
+            "res_mode": "add",
+        },
+        "premium_monthly": {
+            "blueprint": {
+                "product_key":  "ai_std_premium_monthly",
+                "product_name": "BoxedAI – Premium (Monthly)",
+                "unit_amount":  499,   # €4.99
+                "interval":     "month",
+                "interval_count": 1,
+                "usage_type":   "licensed",
+            },
+            "base_resources": [
+                {"key": "credits", "quantity": 5000, "unit": "credits"},
+            ],
+            "res_mode": "add",
+        },
+        "enterprise_monthly": {
+            "blueprint": {
+                "product_key":  "ai_std_enterprise_monthly",
+                "product_name": "BoxedAI – Enterprise (Monthly)",
+                "unit_amount":  999,   # €9.99
+                "interval":     "month",
+                "interval_count": 1,
+                "usage_type":   "licensed",
+            },
+            "base_resources": [
+                {"key": "credits", "quantity": 15000, "unit": "credits"},
+            ],
+            "res_mode": "add",
+        },
+
+        # ───────────── Annuali ─────────────
+        "starter_annual": {
+            "blueprint": {
+                "product_key":  "ai_std_starter_annual",
+                "product_name": "BoxedAI – Starter (Annual)",
+                "unit_amount":  1990,  # €19.90
+                "interval":     "year",
+                "interval_count": 1,
+                "usage_type":   "licensed",
+            },
+            "base_resources": [
+                {"key": "credits", "quantity": 12000, "unit": "credits"},  # 12×1000
+            ],
+            "res_mode": "add",
+        },
+        "premium_annual": {
+            "blueprint": {
+                "product_key":  "ai_std_premium_annual",
+                "product_name": "BoxedAI – Premium (Annual)",
+                "unit_amount":  4990,  # €49.90
+                "interval":     "year",
+                "interval_count": 1,
+                "usage_type":   "licensed",
+            },
+            "base_resources": [
+                {"key": "credits", "quantity": 60000, "unit": "credits"},  # 12×5000
+            ],
+            "res_mode": "add",
+        },
+        "enterprise_annual": {
+            "blueprint": {
+                "product_key":  "ai_std_enterprise_annual",
+                "product_name": "BoxedAI – Enterprise (Annual)",
+                "unit_amount":  9990,  # €99.90
+                "interval":     "year",
+                "interval_count": 1,
+                "usage_type":   "licensed",
+            },
+            "base_resources": [
+                {"key": "credits", "quantity": 180000, "unit": "credits"},  # 12×15000
+            ],
+            "res_mode": "add",
+        },
+    },
 }
+
 
 
 # (opzionale) limita quali pricing_method sono ammessi per ciascun piano
