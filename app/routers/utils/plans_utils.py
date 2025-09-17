@@ -1388,6 +1388,76 @@ def ensure_portal_configuration_with_overrides(
     - Controlla duplicati intervallo in-memory
     - Cache fingerprint→configuration_id per evitare Configuration.list
     """
+
+    # ─────────────────────────────────────────────────────────────
+    # 0) Fast-path "VIEW-ONLY": niente varianti/price se subscription_update è disabilitato
+    # ─────────────────────────────────────────────────────────────
+    def _is_view_only(fo: Optional[PortalFeaturesOverride]) -> bool:
+        if not fo:
+            return False
+        d = fo.model_dump(exclude_none=True) or {}
+        su = d.get("subscription_update") or {}
+        return su.get("enabled") is False
+
+    if _is_view_only(features_override):
+        # features base "view-only"
+        features = {
+            "payment_method_update": {"enabled": True},
+            "invoice_history": {"enabled": True},
+            "subscription_update": {"enabled": False},
+            "subscription_cancel": {"enabled": False},
+        }
+        # merge shallow con l’override (mantenendo subscription_update.enabled = False)
+        if features_override:
+            ov = features_override.model_dump(exclude_none=True)
+            for k, v in ov.items():
+                if k == "subscription_update":
+                    cur = features.get("subscription_update", {}) or {}
+                    cur.update({kk: vv for kk, vv in v.items() if kk != "enabled"})
+                    cur["enabled"] = False
+                    features["subscription_update"] = cur
+                else:
+                    features[k] = v
+
+        business_profile = {"headline": f"{plan_type} – Manage billing"}
+        if business_profile_override:
+            business_profile.update(business_profile_override.model_dump(exclude_none=True))
+
+        tag_val = "view_only"
+        desired_fp = _config_fingerprint(
+            plan_type=plan_type, tag=tag_val, features=features, business_profile=business_profile
+        )
+        cache_key = _portal_cache_key(plan_type, tag_val, desired_fp)
+        cached_id = _PORTAL_CONF_CACHE.get(cache_key)
+        if cached_id:
+            return cached_id
+
+        # riuso se esiste già una config col medesimo fingerprint
+        existing = _list_portal_configurations(opts)
+        for conf in existing:
+            md = conf.get("metadata") or {}
+            if md.get("plan_type") == plan_type and md.get("portal_preset") == tag_val and md.get("features_fp") == desired_fp:
+                _PORTAL_CONF_CACHE[cache_key] = conf["id"]
+                return conf["id"]
+
+        # crea nuova configuration "view-only"
+        created = stripe.billing_portal.Configuration.create(
+            business_profile=business_profile,
+            features=features,
+            metadata={
+                "plan_type": plan_type,
+                "portal_preset": tag_val,
+                "features_fp": desired_fp,
+                "features_version": "v2_fp_only",
+            },
+            idempotency_key=_idem(base_idem, f"portal.config.create.{plan_type}.{tag_val}.{desired_fp[:10]}"),
+            **opts,
+        )
+        _PORTAL_CONF_CACHE[cache_key] = created["id"]
+        return created["id"]
+
+
+
     # 1) Varianti
     if variants_override and len(variants_override) > 0:
         variants = variants_override
