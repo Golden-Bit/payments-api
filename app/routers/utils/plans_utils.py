@@ -1214,7 +1214,7 @@ def ensure_portal_configuration(
                 detail=f"Variante '{v}' non definita per plan_type '{plan_type}'"
             )
 
-        price_id, product_id = _ensure_price_for_variant(plan_type, v, base_idem, opts)
+        price_id, product_id, _ = _ensure_price_for_variant(plan_type, v, base_idem, opts)
 
         # (consigliato) Escludi piani a 0 €/periodo dal Portal (free → crea confusione nell'upgrade)
         pr = stripe.Price.retrieve(price_id, **opts)

@@ -107,7 +107,7 @@ def me_create_checkout(
         calc = None  # usato solo nel flusso dinamico
 
         if payload.variant:
-            price_id, created_product_id = _ensure_price_for_variant(
+            price_id, created_product_id, _ = _ensure_price_for_variant(
                 plan_type=payload.plan_type,
                 variant=payload.variant,
                 base_idem=base_idem,
