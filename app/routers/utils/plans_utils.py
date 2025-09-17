@@ -1566,6 +1566,152 @@ def _apply_upgrade_delta_for_credits(
 
     return _to_list(mp)
 
+# --- FAST HELPERS per usare la subscription pre-caricata senza re-retrieve ---
+
+def _active_item_ids_from_sub(sub: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Estrae dal payload della Subscription (già caricato) l'item attivo:
+    - price_id
+    - product_id (stringa, anche se price.product è dict o string)
+    - price_obj (quello presente in sub, se c'è)
+    """
+    items = (sub.get("items") or {}).get("data") or []
+    for it in items:
+        if it.get("deleted"):
+            continue
+        price = it.get("price") or {}
+        price_id = price.get("id")
+        prod = price.get("product")
+        product_id = (prod.get("id") if isinstance(prod, dict) else prod) if prod else None
+        return price_id, product_id, price
+    return None, None, None
+
+
+def _fast_sync_and_rollover_in_memory(
+    sub: Dict[str, Any],
+    opts: Dict[str, Any],
+) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+    """
+    Esegue in-memory:
+      1) SYNC variante/prezzo/prodotto (senza re-retrieve): 1x Price.retrieve SOLO se servono i metadata price.
+      2) ROLLOVER crediti allineato allo “Stripe period” usando la sub già in mano.
+    Ritorna:
+      - patch_md  (solo i campi modificati)
+      - provided  (lista risorse after-sync/rollover)
+      - used      (lista risorse after-sync/rollover)
+      - changed   (True se qualcosa da patchare su Stripe)
+    """
+    md = sub.get("metadata") or {}
+    provided = _parse_resources_json(md.get("resources_provided_json"))
+    used = _parse_resources_json(md.get("resources_used_json"))
+    base = _parse_resources_json(md.get("base_resources_provided_json"))
+    res_mode = (md.get("res_mode") or "reset").strip().lower()
+
+    patch_md: Dict[str, str] = {}
+    changed = False
+
+    # ── 1) SYNC variante / price / product (senza re-retrieve)
+    price_id_cur, product_id_cur, price_obj_in_sub = _active_item_ids_from_sub(sub)
+    need_price_metadata = False
+    if price_id_cur and (
+        md.get("active_price_id") != price_id_cur or
+        md.get("active_product_id") != product_id_cur or
+        (not md.get("variant")) or
+        (not md.get("plan_type"))
+    ):
+        # Prova a leggere i metadata del price dall’oggetto già presente
+        price_md = (price_obj_in_sub or {}).get("metadata") or {}
+        if not price_md or not price_md.get("variant"):
+            need_price_metadata = True
+
+        if need_price_metadata:
+            # 1 sola chiamata Price.retrieve (no expand): basta id product e metadata
+            pr = stripe.Price.retrieve(price_id_cur, **opts)
+            price_md = pr.get("metadata") or {}
+            prod = pr.get("product")
+            product_id_cur = (prod.get("id") if isinstance(prod, dict) else prod) or product_id_cur
+
+        new_variant = price_md.get("variant")
+        new_plan_type = price_md.get("plan_type") or md.get("plan_type")
+
+        # aggiorna sempre gli id attivi
+        if price_id_cur:
+            patch_md["active_price_id"] = price_id_cur
+        if product_id_cur:
+            patch_md["active_product_id"] = product_id_cur
+
+        # se riconosciamo plan_type/variant → aggiorna base/resources + grant config
+        if new_plan_type and new_variant and new_plan_type in PLAN_VARIANTS and new_variant in PLAN_VARIANTS[new_plan_type]:
+            old_base = base
+            base_new = PLAN_VARIANTS[new_plan_type][new_variant].get("base_resources") or []
+            provided = _apply_upgrade_delta_for_credits(provided, used, old_base, base_new)
+            base = base_new  # per eventuale rollover più sotto
+
+            # res_mode & grant config dalla variante/policy
+            vconf = PLAN_VARIANTS[new_plan_type][new_variant]
+            res_mode = str(vconf.get("res_mode") or PLAN_POLICIES.get(new_plan_type, {}).get("res_mode") or "add")
+
+            patch_md.update({
+                "plan_type": new_plan_type,
+                "variant": new_variant,
+                "base_resources_provided_json": json.dumps(base_new, separators=(",", ":")),
+                "res_mode": res_mode,
+                "res_grant_interval": str(PLAN_POLICIES.get(new_plan_type, {}).get("res_grant_interval") or "month"),
+                "res_grant_interval_count": str(int(PLAN_POLICIES.get(new_plan_type, {}).get("res_grant_interval_count") or 1)),
+            })
+        changed = True
+
+    # ── 2) ROLLOVER allineato a Stripe period (senza re-retrieve)
+    interval, interval_count = _extract_grant_config_from_metadata({**md, **patch_md})
+    now_ts = _now_ts()
+    try:
+        last_grant_period_end = int(md.get("last_grant_period_end") or 0)
+    except Exception:
+        last_grant_period_end = 0
+
+    # init "last_grant_period_end" se manca, usando current_period_end della sub già in mano
+    if last_grant_period_end <= 0:
+        curr_end = int(sub.get("current_period_end") or 0)
+        if curr_end > 0 and base:
+            patch_md.update({
+                "last_grant_period_end": str(curr_end),
+                "last_grant_at": str(now_ts),
+            })
+            # assicurati che i campi esistano (ma non risovrascrivere se già popolati)
+            if not provided:
+                provided = list(base)
+                patch_md["resources_provided_json"] = json.dumps(provided, separators=(",", ":"))
+            if not used:
+                used = []
+                patch_md["resources_used_json"] = "[]"
+            changed = True
+        # se non abbiamo current_period_end o base → nessun rollover
+        return patch_md, provided, used, changed
+
+    # se abbiamo una base nuova dal sync, usala
+    base = _parse_resources_json(patch_md.get("base_resources_provided_json")) or base
+
+    # applica grant multipli se sono passati più boundaries
+    grants = 0
+    cursor = last_grant_period_end
+    while cursor and now_ts >= cursor:
+        provided, used = _apply_resource_grant(provided, used, base, res_mode)
+        grants += 1
+        if grants >= 36:  # cap di sicurezza
+            break
+        cursor = _advance_ts_calendar(cursor, interval, interval_count)
+
+    if grants > 0:
+        patch_md.update({
+            "resources_provided_json": json.dumps(provided, separators=(",", ":")),
+            "resources_used_json": json.dumps(used, separators=(",", ":")),
+            "last_grant_period_end": str(cursor),
+            "last_grant_at": str(now_ts),
+            "last_grant_count": str(grants),
+        })
+        changed = True
+
+    return patch_md, provided, used, changed
 
 ########################################################################################################################
 ########################################################################################################################

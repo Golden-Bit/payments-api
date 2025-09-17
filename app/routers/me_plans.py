@@ -772,7 +772,7 @@ def me_get_subscription_resources(
         "customer_id": customer_id,
     }
 
-
+'''
 @router.post(
     "/subscriptions/{subscription_id}/resources/consume",
     summary="Consuma risorse della Subscription — SERVER (JWT + API Key)",
@@ -875,8 +875,101 @@ def consume_subscription_resources(
         "period_start": period_start,
         "period_end": period_end,
         "customer_id": customer_id,
-    }
+    }'''
 
+@router.post(
+    "/subscriptions/{subscription_id}/resources/consume",
+    summary="Consuma risorse della Subscription — SERVER (JWT + API Key)",
+    dependencies=[Security(require_admin_api_key)],
+)
+def consume_subscription_resources(
+    subscription_id: str,
+    payload: ConsumeResourcesRequest = Body(...),
+    request: Request = None,
+):
+    # 1) Contesto + Stripe opts
+    user = request.state.user
+    opts = _opts_from_request(request)
+
+    # 2) Carica UNA volta la Subscription (niente expand: basta il suboggetto price “light”)
+    sub = stripe.Subscription.retrieve(subscription_id, **opts)
+    md = sub.get("metadata") or {}
+
+    # 3) Ownership (fail-fast): se internal_customer_ref non combacia, 403 immediato
+    internal_ref = md.get("internal_customer_ref")
+    if internal_ref and str(internal_ref) != str(user["user_ref"]):
+        raise HTTPException(status_code=403, detail="Mismatch internal_customer_ref vs user_ref.")
+
+    # 3.b) Doppia ownership (customer): esegui SOLO qui la risoluzione del customer_id
+    customer_id = _get_or_ensure_customer_id_cached(
+        user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts
+    )
+    if str(sub.get("customer")) != str(customer_id):
+        raise HTTPException(status_code=403, detail="Subscription non appartiene all'utente.")
+
+    # 4) SYNC + ROLLOVER fast (zero re-retrieve; al massimo 1 Price.retrieve se serve)
+    patch_md_sync_roll, provided, used, changed = _fast_sync_and_rollover_in_memory(sub, opts)
+
+    # 5) Concurrency guards (post-sync): confronta con i valori EFFETTIVI
+    effective_md = {**md, **patch_md_sync_roll}
+    if payload.expected_plan_type and payload.expected_plan_type != effective_md.get("plan_type"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Plan type cambiato: atteso '{payload.expected_plan_type}', attuale '{effective_md.get('plan_type')}'"
+        )
+    if payload.expected_variant and payload.expected_variant != effective_md.get("variant"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Variant cambiata: attesa '{payload.expected_variant}', attuale '{effective_md.get('variant')}'"
+        )
+
+    # 6) Period bounds robusti (possiamo usare la sub già in mano)
+    period_start, period_end = _infer_period_bounds(sub)
+
+    # 7) Validazione vincoli delta e calcolo nuovo "used"
+    plan_type = effective_md.get("plan_type") or ""
+    delta_list = [it.model_dump() for it in payload.items]
+    _assert_consume_constraints(plan_type, delta_list)
+
+    new_used_map = _to_map(used)
+    for it in delta_list:
+        k = (it.get("key"), it.get("unit"))
+        q = float(it.get("quantity", 0) or 0)
+        if q < 0:
+            raise HTTPException(status_code=400, detail="Quantità negativa non consentita nel consumo.")
+        new_used_map[k] = new_used_map.get(k, 0.0) + q
+    new_used = _to_list(new_used_map)
+
+    # 8) Guardrail: non superare il provided “post sync/rollover”
+    _assert_not_exceed(provided, new_used)
+
+    # 9) Unico PATCH a Stripe (merge: sync/rollover + consumo)
+    final_patch = dict(effective_md)  # base = md + patch_sync_roll
+    final_patch["resources_used_json"] = json.dumps(new_used, separators=(",", ":"))
+    if payload.reason:
+        final_patch["resources_last_reason"] = payload.reason
+
+    updated = stripe.Subscription.modify(subscription_id, metadata=final_patch, **opts)
+
+    # 10) Remaining & risposta
+    remaining = _compute_remaining(provided, new_used)
+    return {
+        "subscription_id": subscription_id,
+        "resources": {
+            "provided": provided,
+            "used": new_used,
+            "remaining": remaining,
+        },
+        "metadata": {
+            "plan_type": updated["metadata"].get("plan_type"),
+            "variant": updated["metadata"].get("variant"),
+            "pricing_method": updated["metadata"].get("pricing_method"),
+        },
+        "active_price_id": updated["metadata"].get("active_price_id"),
+        "period_start": period_start,
+        "period_end": period_end,
+        "customer_id": customer_id,
+    }
 
 @router.post(
     "/subscriptions/{subscription_id}/resources/set",
