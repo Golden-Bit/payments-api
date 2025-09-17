@@ -19,7 +19,8 @@ from .utils.plans_utils import _require_bearer_token, _verify_and_get_user, _bas
     _assert_consume_constraints, PLAN_VARIANTS, _ensure_price_for_variant, _sync_subscription_variant_state, \
     _infer_period_bounds, ensure_portal_configuration, _resolve_portal_configuration_id, \
     PortalFeaturesOverride, PortalCancelDeepLinkRequest, PortalUpdateDeepLinkRequest, BusinessProfileOverride, \
-    PortalConfigSelector, _find_alive_subscription_id_for_customer, PortalSessionRequest, PortalUpgradeDeepLinkRequest
+    PortalConfigSelector, _find_alive_subscription_id_for_customer, PortalSessionRequest, PortalUpgradeDeepLinkRequest, \
+    _fast_sync_and_rollover_in_memory
 from ..security import require_jwt_user, optional_stripe_connect_account, optional_idempotency_key, \
     require_admin_api_key
 
