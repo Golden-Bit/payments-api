@@ -52,9 +52,7 @@ _WHITELIST_FILE = _discover_whitelist_file(
     )
 )
 
-print(_WHITELIST_FILE.absolute())
 _WHITELIST_FILE = _WHITELIST_FILE.absolute()
-print(_WHITELIST_FILE)
 
 def _load_whitelist_from_disk() -> Set[str]:
     """
@@ -123,13 +121,12 @@ def _provider_user_id(user: Dict[str, Any]) -> str:
 
 def _is_user_whitelisted(uid: str) -> bool:
     with _WHITELIST_LOCK:
-        print(uid)
-        print(_COGNITO_WHITELIST)
+
         return uid in _COGNITO_WHITELIST
 
 def _require_user_whitelisted(user: Dict[str, Any]) -> None:
     uid = _provider_user_id(user)
-    print(uid)
+
     if not uid or not _is_user_whitelisted(uid):
         raise HTTPException(
             status_code=403,
