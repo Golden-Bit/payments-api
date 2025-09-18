@@ -52,7 +52,9 @@ _WHITELIST_FILE = _discover_whitelist_file(
     )
 )
 
-print(_WHITELIST_FILE )
+print(_WHITELIST_FILE.absolute())
+_WHITELIST_FILE = _WHITELIST_FILE.absolute()
+print(_WHITELIST_FILE)
 
 def _load_whitelist_from_disk() -> Set[str]:
     """
