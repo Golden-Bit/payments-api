@@ -11,7 +11,8 @@ import stripe
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status, Security
 from pydantic import BaseModel, Field, EmailStr
 
-from .utils.identity_utils import _save_whitelist_to_disk, _WHITELIST_FILE, _COGNITO_WHITELIST, _WHITELIST_LOCK
+from .utils.identity_utils import _save_whitelist_to_disk, _WHITELIST_FILE, _COGNITO_WHITELIST, _WHITELIST_LOCK, \
+    _require_user_whitelisted
 from .utils.plans_utils import _require_bearer_token, _verify_and_get_user, _base_idem_from_request, _opts_from_request, \
     _get_or_ensure_customer_id_cached, _idem, _raise_from_stripe_error, \
     CancelRequest, PauseRequest, ResumeRequest, AttachMeRequest, _create_price_from_dynamic_request, \
@@ -81,6 +82,8 @@ def me_create_checkout(
     # 0) Auth utente
     user = request.state.user
     access_token = request.state.access_token
+
+    _require_user_whitelisted(user)
 
     # 1) Idempotency & Stripe opts
     base_idem = _base_idem_from_request(request)
@@ -377,7 +380,7 @@ def me_billing_portal(
     # 1) Auth: JWT utente + API Key admin
     user = request.state.user
     access_token = request.state.access_token
-
+    _require_user_whitelisted(user)
     # 2) Stripe opts (es. Connect) + Idempotency
     opts = _opts_from_request(request)
     base_idem = _base_idem_from_request(request)
@@ -442,7 +445,7 @@ def me_portal_deeplink_update(
 ):
     user = request.state.user
     access_token = request.state.access_token
-
+    _require_user_whitelisted(user)
     opts = _opts_from_request(request)
     ret_url = _validate_return_url(payload.return_url)
 
@@ -491,7 +494,7 @@ def me_portal_deeplink_upgrade(
     # 1) Autorizzazioni e contesto
     user = request.state.user
     access_token = request.state.access_token
-
+    _require_user_whitelisted(user)
     opts = _opts_from_request(request)
     ret_url = _validate_return_url(payload.return_url)
     base_idem = _base_idem_from_request(request)
