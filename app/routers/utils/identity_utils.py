@@ -48,7 +48,7 @@ def _discover_whitelist_file(configured: str) -> Path:
 _WHITELIST_FILE = _discover_whitelist_file(
     os.getenv(
         "WHITELIST_FILE",
-        "app\\data\\whitelist_cognito_subs.json"
+        "app/data/whitelist_cognito_subs.json"
     )
 )
 
