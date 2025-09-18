@@ -1984,7 +1984,7 @@ ALLOWED_METHODS_BY_PLAN: Dict[str, List[str]] = {
 }
 
 # (opzionale) allowlist domini di redirect per evitare open-redirect
-REDIRECT_ALLOWLIST = os.getenv("REDIRECT_ALLOWLIST", "https://teatek-llm.theia-innovation.com/boxed-ai/,https://tuo-sito.com,https://console.tuo-sito.com,http://localhost:3000")
+REDIRECT_ALLOWLIST = os.getenv("REDIRECT_ALLOWLIST", "https://teatek-llm.theia-innovation.com,https://tuo-sito.com,https://console.tuo-sito.com,http://localhost:3000")
 _ALLOWED_RETURN_HOSTS = {u.strip() for u in REDIRECT_ALLOWLIST.split(",") if u.strip()}
 
 from urllib.parse import urlparse
@@ -1992,7 +1992,8 @@ def _validate_return_url(url: str) -> str:
     try:
         u = urlparse(url)
         origin = f"{u.scheme}://{u.netloc}"
-
+        print(origin)
+        print(_ALLOWED_RETURN_HOSTS)
         if origin not in _ALLOWED_RETURN_HOSTS:
             raise ValueError(f"origin non in allowlist: {origin}")
         return url

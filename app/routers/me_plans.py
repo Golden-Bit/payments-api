@@ -393,7 +393,7 @@ def me_billing_portal(
     ret_url = _validate_return_url(payload.return_url)
 
     # 5) Risolvi/riusa la Billing Portal Configuration dal selettore passato
-    start_t = time.time()
+
     try:
         config_id = _resolve_portal_configuration_id(
             selector=payload.portal,
@@ -407,10 +407,8 @@ def me_billing_portal(
         # errori Stripe generici → adattati
         _raise_from_stripe_error(e)
 
-    end_t = time.time()
-    print(f"delta time# {end_t - start_t}")
-
     # 6) Crea la session del Billing Portal
+
     try:
         create_kwargs = {
             "customer": customer_id,
@@ -424,6 +422,7 @@ def me_billing_portal(
             create_kwargs["flow_data"] = payload.flow_data
 
         sess = stripe.billing_portal.Session.create(**create_kwargs)
+
 
         return {"id": sess["id"], "url": sess["url"], "configuration_id": config_id}
     except HTTPException:
