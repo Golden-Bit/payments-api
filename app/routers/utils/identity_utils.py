@@ -48,8 +48,33 @@ def _save_whitelist_to_disk(ids: Set[str]) -> None:
 _COGNITO_WHITELIST: Set[str] = _load_whitelist_from_disk()
 
 def _provider_user_id(user: Dict[str, Any]) -> str:
-    # Cognito: 'sub' (fallback 'cognito:username')
-    return str(user.get("sub") or user.get("cognito:username") or "").strip()
+    """
+    Restituisce l'ID del provider (Cognito 'sub').
+    Struttura attuale dell'oggetto user:
+      {
+        'user_ref': '...',
+        'username': '...',
+        'email': ...,
+        'name': ...,
+        'claims': {'sub': '...', 'username': '...', ...}
+      }
+    """
+    if not user:
+        return ""
+
+    # 1) forma corretta: Cognito 'sub' dentro i claims
+    claims = user.get("claims") or {}
+    uid = claims.get("sub")
+
+    # 2) fallback difensivi (solo se proprio manca nei claims)
+    if not uid:
+        uid = user.get("sub")  # in alcuni setup il middleware lo espone top-level
+    if not uid:
+        # spesso user_ref == sub nel tuo setup; usalo come ultima spiaggia
+        uid = user.get("user_ref")
+
+    return str(uid or "").strip()
+
 
 def _is_user_whitelisted(uid: str) -> bool:
     with _WHITELIST_LOCK:
@@ -59,6 +84,7 @@ def _is_user_whitelisted(uid: str) -> bool:
 
 def _require_user_whitelisted(user: Dict[str, Any]) -> None:
     uid = _provider_user_id(user)
+    print(uid)
     if not uid or not _is_user_whitelisted(uid):
         raise HTTPException(
             status_code=403,
