@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 import stripe
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request, status, Security
 from pydantic import BaseModel, Field, EmailStr
+
+from .utils.identity_utils import _save_whitelist_to_disk, _WHITELIST_FILE, _COGNITO_WHITELIST, _WHITELIST_LOCK
 from .utils.plans_utils import _require_bearer_token, _verify_and_get_user, _base_idem_from_request, _opts_from_request, \
     _get_or_ensure_customer_id_cached, _idem, _raise_from_stripe_error, \
     CancelRequest, PauseRequest, ResumeRequest, AttachMeRequest, _create_price_from_dynamic_request, \
@@ -1086,17 +1088,14 @@ def me_list_subscriptions(
     opts = _opts_from_request(request)
 
     try:
-        t_1 = time.time()
+
         customer_id = _get_or_ensure_customer_id_cached(user_ref=user["user_ref"], email=user["email"], name=user["name"], opts=opts)
-        t_2 = time.time()
+
         params: Dict[str, Any] = {"customer": customer_id, "limit": limit}
         if status_filter:
             params["status"] = status_filter
         subscriptions = stripe.Subscription.list(**params, **opts)
-        t_3 = time.time()
-        print("#"*120)
-        print(t_2 - t_1, t_3 - t_2)
-        print("#" * 120)
+
         return subscriptions
     except Exception as e:
         _raise_from_stripe_error(e)
@@ -1300,3 +1299,51 @@ def me_attach_payment_method(
         return pm
     except Exception as e:
         _raise_from_stripe_error(e)
+
+# --- KEEP / CONFIRM
+class WhitelistPatch(BaseModel):
+    replace: Optional[List[str]] = None
+    add: List[str] = Field(default_factory=list)
+    remove: List[str] = Field(default_factory=list)
+
+# --- REPLACE: endpoints gestione whitelist (admin-only, persistenti su file)
+
+@router.get(
+    "/whitelist",
+    summary="Legge la whitelist (Cognito 'sub') abilitata agli acquisti",
+    dependencies=[Security(require_admin_api_key)],
+)
+def get_purchases_whitelist():
+    with _WHITELIST_LOCK:
+        return {"whitelist": sorted(_COGNITO_WHITELIST), "file": str(_WHITELIST_FILE)}
+
+@router.post(
+    "/whitelist",
+    summary="Aggiorna la whitelist (Cognito 'sub') per gli acquisti",
+    dependencies=[Security(require_admin_api_key)],
+)
+def patch_purchases_whitelist(patch: WhitelistPatch = Body(...)):
+    normalized_add = [s.strip() for s in (patch.add or []) if s and s.strip()]
+    normalized_remove = [s.strip() for s in (patch.remove or []) if s and s.strip()]
+    normalized_replace = None
+    if patch.replace is not None:
+        normalized_replace = [s.strip() for s in patch.replace if s and s.strip()]
+
+    with _WHITELIST_LOCK:
+        if normalized_replace is not None:
+            _COGNITO_WHITELIST.clear()
+            _COGNITO_WHITELIST.update(normalized_replace)
+        else:
+            _COGNITO_WHITELIST.update(normalized_add)
+            _COGNITO_WHITELIST.difference_update(normalized_remove)
+
+        # Salvataggio persistente su disco
+        _save_whitelist_to_disk(_COGNITO_WHITELIST)
+
+        return {
+            "whitelist": sorted(_COGNITO_WHITELIST),
+            "file": str(_WHITELIST_FILE),
+            "replaced": normalized_replace is not None,
+            "added": normalized_add,
+            "removed": normalized_remove,
+        }
