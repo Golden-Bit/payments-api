@@ -1808,10 +1808,6 @@ def _fast_sync_and_rollover_in_memory(
 # Predefiniamo due preset:
 # - "monthly": mostra le varianti mensili
 # - "annual":  mostra le varianti annuali
-PORTAL_PRESETS: Dict[str, List[str]] = {
-    "monthly": [ "base_monthly", "pro_monthly"],
-    "annual":  [ "base_annual",  "pro_annual"],
-}
 
 PORTAL_PRESETS: Dict[str, List[str]] = {
     # mostriamo le 3 varianti mensili nel portal "monthly"
@@ -1829,27 +1825,6 @@ PORTAL_PRESETS: Dict[str, List[str]] = {
 }
 
 
-
-# --- NEW: Regole per risorsa per plan_type (vincoli min/max/step) ---
-# Le chiavi delle risorse DEVONO combaciare con quelle usate dai pricing methods.
-'''RESOURCE_RULES: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {
-    # Esempio: per AI Standard
-    "Cloud Standard": {
-        "n_servers":     {"min": 1.0,   "max": 50.0,   "step": 1.0},
-        "ssd_gb":        {"min": 0.0,   "max": 5000.0, "step": 10.0},
-        "bandwidth_tb":  {"min": 0.0,   "max": 100.0,  "step": 1.0},
-        "gpu_hours":     {"min": None,  "max": None,   "step": None},  # opzionale
-        "storage_gb":    {"min": 0.0,   "max": 10000.0,"step": 10.0},
-    },
-    # Esempio: per AI Pro
-    "Cloud Pro": {
-        "n_servers":     {"min": 1.0,   "max": 200.0,  "step": 1.0},
-        "ssd_gb":        {"min": 0.0,   "max": 20000.0,"step": 10.0},
-        "bandwidth_tb":  {"min": 0.0,   "max": 300.0,  "step": 1.0},
-        "gpu_hours":     {"min": 0.0,   "max": 5000.0, "step": 1.0},
-        "storage_gb":    {"min": 0.0,   "max": 50000.0,"step": 10.0},
-    },
-}'''
 
 # --- Regole risorsa: ora gestiamo solo "credits" (accumulabili) ---
 RESOURCE_RULES: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {
@@ -1908,62 +1883,6 @@ PLAN_POLICIES: Dict[str, Dict[str, Any]] = {
 }
 
 
-'''PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
-    "AI Standard": {
-        # Mensili
-        "base_monthly": {
-            "blueprint": {
-                "product_key": "ai_plan_base_monthly",
-                "product_name": "AI Plan – Base (Monthly)",
-                "unit_amount": 2900,  # €29,00
-                "interval": "month", "interval_count": 1, "usage_type": "licensed",
-            },
-            "base_resources": [
-                {"key": "credits", "quantity": 1000, "unit": "credits"},
-            ],
-            "res_mode": "add",
-        },
-        "pro_monthly": {
-            "blueprint": {
-                "product_key": "ai_plan_pro_monthly",
-                "product_name": "AI Plan – Pro (Monthly)",
-                "unit_amount": 9900,  # €99,00
-                "interval": "month", "interval_count": 1, "usage_type": "licensed",
-            },
-            "base_resources": [
-                {"key": "credits", "quantity": 5000, "unit": "credits"},
-            ],
-            "res_mode": "add",
-        },
-
-        # Annuali (puoi scegliere se mettere 12x o la stessa dote mensile: i grant seguiranno policy)
-        "base_annual": {
-            "blueprint": {
-                "product_key": "ai_plan_base_annual",
-                "product_name": "AI Plan – Base (Annual)",
-                "unit_amount": 29000,  # €290,00
-                "interval": "year", "interval_count": 1, "usage_type": "licensed",
-            },
-            "base_resources": [
-                {"key": "credits", "quantity": 12000, "unit": "credits"},  # 12×1000
-            ],
-            "res_mode": "add",
-        },
-        "pro_annual": {
-            "blueprint": {
-                "product_key": "ai_plan_pro_annual",
-                "product_name": "AI Plan – Pro (Annual)",
-                "unit_amount": 99000,  # €990,00
-                "interval": "year", "interval_count": 1, "usage_type": "licensed",
-            },
-            "base_resources": [
-                {"key": "credits", "quantity": 60000, "unit": "credits"},  # 12×5000
-            ],
-            "res_mode": "add",
-        },
-    },
-}'''
-
 PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "ai_standard": {
         # ───────────── Mensili ─────────────
@@ -1977,7 +1896,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 1000, "unit": "credits"},
+                {"key": "credits", "quantity": 1990, "unit": "credits"},
             ],
             "res_mode": "add",
         },
@@ -1991,7 +1910,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 5000, "unit": "credits"},
+                {"key": "credits", "quantity": 4990, "unit": "credits"},
             ],
             "res_mode": "add",
         },
@@ -2005,7 +1924,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 15000, "unit": "credits"},
+                {"key": "credits", "quantity": 9990, "unit": "credits"},
             ],
             "res_mode": "add",
         },
@@ -2021,7 +1940,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 12000, "unit": "credits"},  # 12×1000
+                {"key": "credits", "quantity": 0, "unit": "credits"},  # 12×1000
             ],
             "res_mode": "add",
         },
@@ -2035,7 +1954,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 60000, "unit": "credits"},  # 12×5000
+                {"key": "credits", "quantity": 0, "unit": "credits"},  # 12×5000
             ],
             "res_mode": "add",
         },
@@ -2049,7 +1968,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 180000, "unit": "credits"},  # 12×15000
+                {"key": "credits", "quantity": 0, "unit": "credits"},  # 12×15000
             ],
             "res_mode": "add",
         },
@@ -2065,7 +1984,7 @@ ALLOWED_METHODS_BY_PLAN: Dict[str, List[str]] = {
 }
 
 # (opzionale) allowlist domini di redirect per evitare open-redirect
-REDIRECT_ALLOWLIST = os.getenv("REDIRECT_ALLOWLIST", "https://tuo-sito.com,https://console.tuo-sito.com,http://localhost:3000")
+REDIRECT_ALLOWLIST = os.getenv("REDIRECT_ALLOWLIST", "https://teatek-llm.theia-innovation.com/boxed-ai/,https://tuo-sito.com,https://console.tuo-sito.com,http://localhost:3000")
 _ALLOWED_RETURN_HOSTS = {u.strip() for u in REDIRECT_ALLOWLIST.split(",") if u.strip()}
 
 from urllib.parse import urlparse
