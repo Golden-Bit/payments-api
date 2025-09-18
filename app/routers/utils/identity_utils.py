@@ -53,6 +53,8 @@ def _provider_user_id(user: Dict[str, Any]) -> str:
 
 def _is_user_whitelisted(uid: str) -> bool:
     with _WHITELIST_LOCK:
+        print(uid)
+        print(_WHITELIST_LOCK)
         return uid in _COGNITO_WHITELIST
 
 def _require_user_whitelisted(user: Dict[str, Any]) -> None:
