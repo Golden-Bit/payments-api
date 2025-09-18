@@ -9,7 +9,48 @@ from fastapi import HTTPException
 
 # --- REPLACE: stato whitelist e helper (persistenza JSON su disco)
 _WHITELIST_LOCK = RLock()
-_WHITELIST_FILE = Path(os.getenv("WHITELIST_FILE", "C:\\Users\\info\\Desktop\\work_space\\repositories\\payments-api\\app\\data\\whitelist_cognito_subs.json"))  # path configurabile
+# --- REPLACE: usa la discovery (funziona su Linux/Windows)
+
+# --- ADD: discovery del file whitelist in CWD quando il path configurato non esiste
+def _discover_whitelist_file(configured: str) -> Path:
+    """
+    Ritorna il Path effettivo da usare:
+      1) se il path configurato esiste → usalo;
+      2) altrimenti cerca in tutta la working directory (ricorsivo) un file con lo stesso nome;
+         - prima ricerca case-sensitive (match esatto del nome)
+         - poi fallback case-insensitive (utile su Linux se il nome ha case diverso)
+      3) se non trovato, ritorna comunque il path configurato (verrà creato in _save_whitelist_to_disk).
+    """
+    candidate = Path(configured).expanduser()
+    if candidate.exists():
+        return candidate
+
+    root = Path.cwd()
+    fname = candidate.name
+
+    # 2a) match esatto del nome
+    for p in root.rglob(fname):
+        if p.is_file():
+            return p
+
+    # 2b) fallback case-insensitive (potrebbe essere costoso, ma è usato solo se non trovata corrispondenza esatta)
+    fname_lower = fname.lower()
+    for p in root.rglob("*"):
+        try:
+            if p.is_file() and p.name.lower() == fname_lower:
+                return p
+        except Exception:
+            continue
+
+    # 3) non trovato: useremo il path configurato (che verrà creato alla prima scrittura)
+    return candidate
+
+_WHITELIST_FILE = _discover_whitelist_file(
+    os.getenv(
+        "WHITELIST_FILE",
+        "app\\data\\whitelist_cognito_subs.json"
+    )
+)
 
 def _load_whitelist_from_disk() -> Set[str]:
     """
