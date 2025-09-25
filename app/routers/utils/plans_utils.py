@@ -1968,7 +1968,7 @@ PLAN_VARIANTS: Dict[str, Dict[str, Dict[str, Any]]] = {
                 "usage_type":   "licensed",
             },
             "base_resources": [
-                {"key": "credits", "quantity": 0, "unit": "credits"},  # 12×15000
+                {"key": "credits", "quantity": 999999, "unit": "credits"},  # 12×15000
             ],
             "res_mode": "add",
         },
