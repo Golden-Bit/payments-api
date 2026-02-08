@@ -90,6 +90,21 @@ def _save_whitelist_to_disk(ids: Set[str]) -> None:
 # Cache in-memory inizializzata da disco
 _COGNITO_WHITELIST: Set[str] = _load_whitelist_from_disk()
 
+_WHITELIST_MTIME = _WHITELIST_FILE.stat().st_mtime if _WHITELIST_FILE.exists() else 0.0
+
+def _reload_whitelist_if_changed() -> None:
+    global _WHITELIST_MTIME
+    try:
+        mtime = _WHITELIST_FILE.stat().st_mtime
+    except FileNotFoundError:
+        mtime = 0.0
+
+    if mtime != _WHITELIST_MTIME:
+        fresh = _load_whitelist_from_disk()
+        _COGNITO_WHITELIST.clear()
+        _COGNITO_WHITELIST.update(fresh)
+        _WHITELIST_MTIME = mtime
+
 def _provider_user_id(user: Dict[str, Any]) -> str:
     """
     Restituisce l'ID del provider (Cognito 'sub').
@@ -121,7 +136,7 @@ def _provider_user_id(user: Dict[str, Any]) -> str:
 
 def _is_user_whitelisted(uid: str) -> bool:
     with _WHITELIST_LOCK:
-
+        _reload_whitelist_if_changed()
         return uid in _COGNITO_WHITELIST
 
 def _require_user_whitelisted(user: Dict[str, Any]) -> None:
