@@ -2,7 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .routers import user, admin, proxy, webhooks, me_plans
+from .routers import user, admin, proxy, webhooks, me_plans, me_plans_whitelist
 
 app = FastAPI(
     title="Stripe Gateway API (FastAPI)",
@@ -31,3 +31,4 @@ if cors_list:
 #app.include_router(proxy.user_proxy)
 app.include_router(webhooks.router)
 app.include_router(me_plans.router)
+app.include_router(me_plans_whitelist.router)

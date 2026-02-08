@@ -1303,7 +1303,7 @@ def me_attach_payment_method(
     except Exception as e:
         _raise_from_stripe_error(e)
 
-# --- KEEP / CONFIRM
+"""# --- KEEP / CONFIRM
 class WhitelistPatch(BaseModel):
     replace: Optional[List[str]] = None
     add: List[str] = Field(default_factory=list)
@@ -1349,4 +1349,4 @@ def patch_purchases_whitelist(patch: WhitelistPatch = Body(...)):
             "replaced": normalized_replace is not None,
             "added": normalized_add,
             "removed": normalized_remove,
-        }
+        }"""
