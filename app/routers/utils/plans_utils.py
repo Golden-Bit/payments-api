@@ -27,7 +27,7 @@ _auth_sdk = CognitoSDK(base_url=AUTH_API_BASE)
 
 
 # --- ADD CONFIG: Admin API Key per endpoint privilegiati ---
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "adminkey123:admin")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "hV45/GRT*_fn7$fsa1!")
 
 # Se necessario, puoi fissare anche la Stripe API version via env
 STRIPE_API_VERSION = os.getenv("STRIPE_API_VERSION")
